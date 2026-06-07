@@ -8,8 +8,8 @@ import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk
 import customtkinter as ctk
-import datetime
 import time
+from datetime import datetime, timedelta
 
 # Import the Drag and Drop modules
 from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -20,6 +20,18 @@ COMMAND_PORT = 6006
 SCREEN_STREAM_PORT = 7007  
 
 network_database = {}
+
+# Place near your other global dictionaries/configurations
+DASHBOARD_SYNC_STATE = {
+    "last_sync_date": None  # Tracks the date string (YYYY-MM-DD) of the last run
+}
+
+DATA_STORE_DIR = "data_store"
+
+GLOBAL_DAILY_ARCHIVE_REGISTRY = {
+    "current_date": datetime.now().strftime("%Y-%m-%d"),
+    "processed_ips": set()
+}
 
 # Strict preservation of original length-prefixed socket background processing listener
 def start_agent_listener(update_callback):
@@ -63,11 +75,27 @@ def start_agent_listener(update_callback):
                 except Exception:
                     payload = {}
 
+                # --- CHAT EXIT INTERCEPTOR ---
                 if payload.get("action") == "agent_exit_chat":
                     if client_ip in network_database:
                         network_database[client_ip]["chat_status"] = "idle"
                     update_callback()
                     continue 
+
+                # =====================================================================
+                # NEW: VIDEO CALL STATUS UPDATE INTERCEPTOR
+                # =====================================================================
+                if payload.get("type") == "status_update":
+                    if client_ip in network_database:
+                        if payload.get("status") == "idle":
+                            network_database[client_ip]["vc_status"] = "idle"
+                            network_database[client_ip]["vc_peers"] = []
+                        else:
+                            network_database[client_ip]["vc_status"] = "in_vc"
+                            network_database[client_ip]["vc_peers"] = payload.get("peers", [])
+                    update_callback()
+                    continue
+                # =====================================================================
 
                 # Fill default values defensively so UI rendering NEVER crashes
                 if "hostname" not in payload: payload["hostname"] = "WORKSTATION"
@@ -76,11 +104,15 @@ def start_agent_listener(update_callback):
                 if "cpu" not in payload: payload["cpu"] = "Unknown CPU"
                 if "history" not in payload: payload["history"] = []
                 if "devices" not in payload: payload["devices"] = []
-                
+                process_agent_daily_archive(client_ip, payload)
                 # --- STATE FIX PERSISTENCE CORE ---
                 if client_ip in network_database and isinstance(network_database[client_ip], dict):
                     existing_chat = network_database[client_ip].get("chat_status", "idle")
                     payload["chat_status"] = existing_chat
+                    
+                    # 📹 PRESERVE LIVE VIDEO CALL STATE ACROSS NORMAL TELEMETRY HEARTBEATS
+                    payload["vc_status"] = network_database[client_ip].get("vc_status", "idle")
+                    payload["vc_peers"] = network_database[client_ip].get("vc_peers", [])
                     
                     # Keep the exact status set by our manual refresh button
                     payload["status"] = network_database[client_ip].get("status", "OFFLINE")
@@ -88,14 +120,86 @@ def start_agent_listener(update_callback):
                 else:
                     # Brand new discovery entry registration
                     payload["chat_status"] = "idle"
+                    payload["vc_status"] = "idle"
+                    payload["vc_peers"] = []
                     payload["status"] = "ACTIVE"
                     payload["is_active"] = True
                 
-                payload["last_seen"] = datetime.datetime.now()
+                payload["last_seen"] = datetime.now()
                 network_database[client_ip] = payload
                 update_callback()
         except Exception as e:
             print(f"[DEBUG ERROR] Listener thread anomaly: {e}")
+
+def process_agent_daily_archive(agent_ip, payload_dict):
+    """
+    Archives yesterday's browser history and current device specs 
+    into a nested JSON folder hierarchy under data_store/.
+    """
+    try:
+        # FIXED: Cleaned up the direct class calls
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        # Reset tracking registry if calendar shifts while dashboard is running
+        if GLOBAL_DAILY_ARCHIVE_REGISTRY["current_date"] != today_str:
+            GLOBAL_DAILY_ARCHIVE_REGISTRY["current_date"] = today_str
+            GLOBAL_DAILY_ARCHIVE_REGISTRY["processed_ips"].clear()
+
+        # Exit if this agent has checked in and saved data already today
+        if agent_ip in GLOBAL_DAILY_ARCHIVE_REGISTRY["processed_ips"]:
+            return
+
+        # Dynamically build specific directory targets
+        history_dir = os.path.join(DATA_STORE_DIR, "History", agent_ip)
+        device_dir = os.path.join(DATA_STORE_DIR, "Device", agent_ip)
+        
+        os.makedirs(history_dir, exist_ok=True)
+        os.makedirs(device_dir, exist_ok=True)
+        
+        # 1. Filter out browser history belonging to yesterday
+        raw_history = payload_dict.get("history", [])
+        filtered_history = []
+        
+        for entry in raw_history:
+            visit_time = entry.get("ip", "")  # Extract timestamp key converted by Agent
+            if visit_time.startswith(yesterday_str):
+                filtered_history.append({
+                    "url": entry.get("site"),
+                    "visit_time": visit_time
+                })
+        
+        # Write history file: data_store/History/<ip>/<yesterday_date>.json
+        history_file_path = os.path.join(history_dir, f"{yesterday_str}.json")
+        with open(history_file_path, "w", encoding="utf-8") as f:
+            json.dump(filtered_history, f, indent=4, ensure_ascii=False)
+            
+        # 2. Package current connection specifications
+        device_payload = {
+            # FIXED: Direct class use here as well
+            "archive_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "system_specs": {
+                "hostname": payload_dict.get("hostname"),
+                "os": payload_dict.get("os"),
+                "cpu": payload_dict.get("cpu"),
+                "ram": payload_dict.get("ram"),
+                "mac": payload_dict.get("mac")
+            },
+            "connected_devices": payload_dict.get("devices", []),
+            "usb_status": payload_dict.get("usb_status")
+        }
+        
+        # Write device specifications: data_store/Device/<ip>/<current_date>.json
+        device_file_path = os.path.join(device_dir, f"{today_str}.json")
+        with open(device_file_path, "w", encoding="utf-8") as f:
+            json.dump(device_payload, f, indent=4, ensure_ascii=False)
+            
+        # Prevent secondary writes for this client for the remainder of the day
+        GLOBAL_DAILY_ARCHIVE_REGISTRY["processed_ips"].add(agent_ip)
+        print(f"[+] Secure structural backup synchronized for agent: {agent_ip}")
+        
+    except Exception as e:
+        print(f"[-] Failed to execute daily file integration pass for {agent_ip}: {e}")
 
 def active_device_sweeper(update_callback):
     """
@@ -448,6 +552,22 @@ class LANMonitorGUI:
         # Create the container frame for the two side-by-side buttons
         button_container_frame = ctk.CTkFrame(self.root, fg_color="transparent")
 
+        # =====================================================================
+        # PLACE THIS REGISTRATION BLOCK OUTSIDE EXPLICITLY INSIDE YOUR MAIN UI GENERATOR
+        # =====================================================================
+        # Make sure 'button_container_frame' exists where you construct your control panels:
+        self.btn_video_call = ctk.CTkButton(
+            button_container_frame,
+            text="📹 VIDEO MATRIX",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            fg_color=self.c_accent,       
+            hover_color="#00C8D4",       
+            text_color="#0A0D14",        
+            height=36,
+            command=self.open_video_call_manager  # <--- Points to the fixed method directly via class reference
+        )
+        self.btn_video_call.pack(side=tk.LEFT, fill=ctk.X, padx=(0, 5))
+
         # 1. New Chat Manager Button placed on the left side
         self.btn_chat_mgr = ctk.CTkButton(
             button_container_frame,
@@ -557,6 +677,7 @@ class LANMonitorGUI:
         self.device_container.pack(fill=ctk.BOTH, expand=True, padx=5, pady=(0, 5))
 
         self.selected_device_ip = None
+        self.agent_statuses = {}
         self.trigger_network_refresh()
         # =====================================================================
         # RIGHT HAND SIDE CONTAINER
@@ -587,6 +708,248 @@ class LANMonitorGUI:
         
         self.build_interactive_detail_panes()
 
+    def open_video_call_manager(self):
+        """Spawns an auto-refreshing checkbox-driven dashboard displaying real-time 
+        endpoint availability, filtering for verified active webcams, current room peers, and busy locks."""
+        
+        vc_win = tk.Toplevel(self.root) 
+        vc_win.title("VIDEO CALL LINK MANAGER")
+        vc_win.geometry("550x480") 
+        vc_win.configure(bg=self.c_bg)
+        vc_win.resizable(False, False)
+
+        lbl_header = tk.Label(
+            vc_win, 
+            text="// ACTIVE PEER VIDEO MATRIX SYSTEM", 
+            font=("Consolas", 11, "bold"), 
+            fg=self.c_accent, 
+            bg=self.c_bg, 
+            anchor="w"
+        )
+        lbl_header.pack(fill=tk.X, padx=20, pady=(20, 5))
+
+        lbl_status = tk.Label(
+            vc_win, 
+            text="STATUS: STANDBY // SELECT AT LEAST 2 PARTICIPANTS WITH VERIFIED WEBCAMS", 
+            font=("Segoe UI", 9, "bold"), 
+            fg=self.c_text_muted, 
+            bg=self.c_card, 
+            bd=0, 
+            height=2
+        )
+        lbl_status.pack(fill=tk.X, padx=20, pady=5)
+
+        # Scrollable frame container to neatly stack our checkbox rows
+        scroll_container = ctk.CTkScrollableFrame(
+            vc_win, 
+            fg_color=self.c_inner, 
+            border_width=1, 
+            border_color=self.c_border,
+            corner_radius=12
+        )
+        scroll_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+        # Tracking states across redraw cycles
+        checkbox_registry = {}  # Format: { ip: {"variable": BooleanVar, "widget": CTkCheckBox, "label": CTkLabel} }
+
+        def rebuild_and_sync_roster():
+            """Queries the network layout grid dynamically every 1.5 seconds,
+            filtering out devices without cameras updating statuses and locks cleanly."""
+            if not vc_win.winfo_exists():
+                return
+
+            # Gather currently active endpoints from layout container
+            discovered_pcs = []
+            try:
+                for widget in self.device_container.winfo_children():
+                    if hasattr(widget, "winfo_children"):
+                        for sub_w in widget.winfo_children():
+                            txt = getattr(sub_w, "_text", "") or ""
+                            if not txt and hasattr(sub_w, "cget"):
+                                try: txt = sub_w.cget("text")
+                                except: pass
+                            
+                            parts = str(txt).replace("\n", " ").split()
+                            for part in parts:
+                                part_clean = part.strip()
+                                if part_clean.count(".") == 3 and all(i.isdigit() for i in part_clean.split(".")):
+                                    if part_clean not in discovered_pcs:
+                                        discovered_pcs.append(part_clean)
+            except:
+                pass
+
+            if not discovered_pcs:
+                try: discovered_pcs = list(self.active_agents.keys())
+                except: discovered_pcs = []
+
+            # --- DYNAMIC WEBCAM TELEMETRY FILTERING BLOCK ---
+            live_pcs = []
+            for ip in discovered_pcs:
+                if ip in ["127.0.0.1", "localhost"]:
+                    continue
+
+                # Check if agent exists in database and is marked online
+                if "network_database" in globals() and ip in network_database:
+                    db_payload = network_database[ip]
+                    if isinstance(db_payload, dict):
+                        # Verify the general agent runtime state is not flagged offline
+                        if str(db_payload.get("status", "ACTIVE")).strip().upper() == "OFFLINE":
+                            continue
+
+                        # Inspect core device tree telemetry arrays for video capture indicators
+                        raw_devices = db_payload.get("devices", [])
+                        has_hardware_webcam = False
+                        
+                        for dev in raw_devices:
+                            dev_type = str(dev.get("type", "")).strip().upper()
+                            dev_status = str(dev.get("status", "ACTIVE")).strip().upper()
+                            
+                            # Look for Camera, Imaging, or Video Capture device keys that are active
+                            if dev_type in ["CAMERA", "IMAGE", "VIDEO_CAPTURE"] and dev_status == "ACTIVE":
+                                has_hardware_webcam = True
+                                break
+                        
+                        # Only append to the visible roster loop pass if hardware verification checks clear
+                        if has_hardware_webcam:
+                            live_pcs.append(ip)
+
+            # Remove widgets for devices that went offline or disconnected their webcam
+            for old_ip in list(checkbox_registry.keys()):
+                if old_ip not in live_pcs:
+                    checkbox_registry[old_ip]["frame"].destroy()
+                    del checkbox_registry[old_ip]
+
+            # Render or update device rows
+            for ip in live_pcs:
+                agent_state_info = "Idle (Camera Verified)"
+                is_busy = False
+                
+                try:
+                    if "network_database" in globals() and ip in network_database:
+                        db_payload = network_database[ip]
+                        if isinstance(db_payload, dict) and db_payload.get("vc_status") == "in_vc":
+                            peer_list = ", ".join(db_payload.get("vc_peers", []))
+                            agent_state_info = f"In VC with [{peer_list}]"
+                            is_busy = True
+                    elif hasattr(self, "active_agents") and isinstance(self.active_agents, dict) and ip in self.active_agents:
+                        payload = self.active_agents[ip]
+                        if isinstance(payload, dict) and payload.get("vc_status") == "in_vc":
+                            peer_list = ", ".join(payload.get("vc_peers", []))
+                            agent_state_info = f"In VC with [{peer_list}]"
+                            is_busy = True
+                except Exception as e:
+                    print(f"[VC Sync Debug]: {e}")
+
+                # If this IP is completely new and verified, generate its UI row components
+                if ip not in checkbox_registry:
+                    row_frame = ctk.CTkFrame(scroll_container, fg_color="transparent")
+                    row_frame.pack(fill=ctk.X, pady=4, padx=5)
+
+                    chk_var = tk.BooleanVar(value=False)
+                    
+                    cb = ctk.CTkCheckBox(
+                        row_frame,
+                        text=f"  {ip}",
+                        variable=chk_var,
+                        font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                        text_color=self.c_text_main,
+                        border_color=self.c_border,
+                        checkmark_color=self.c_bg,
+                        fg_color=self.c_accent,
+                        hover_color="#00C8D4"
+                    )
+                    cb.pack(side=tk.LEFT, anchor="w")
+
+                    lbl_state = ctk.CTkLabel(
+                        row_frame,
+                        text="",
+                        font=ctk.CTkFont(family="Consolas", size=10, weight="bold")
+                    )
+                    lbl_state.pack(side=tk.RIGHT, anchor="e", padx=10)
+
+                    checkbox_registry[ip] = {
+                        "frame": row_frame,
+                        "variable": chk_var,
+                        "checkbox": cb,
+                        "label": lbl_state
+                    }
+
+                # Dynamically update structural attributes based on real-time status changes
+                registry_item = checkbox_registry[ip]
+                registry_item["label"].configure(text=f"// {agent_state_info.upper()}")
+                
+                if is_busy:
+                    registry_item["variable"].set(False)
+                    registry_item["checkbox"].configure(state="disabled", text_color=self.c_text_muted)
+                    registry_item["label"].configure(text_color=self.c_alert)
+                else:
+                    registry_item["checkbox"].configure(state="normal", text_color=self.c_text_main)
+                    registry_item["label"].configure(text_color=self.c_accent)
+
+            # Queue secondary recursive sync cycle execution pass in 1500ms
+            vc_win.after(1500, rebuild_and_sync_roster)
+
+        def initiate_video_broadcast():
+            """Assembles chosen hosts, ensures zero policy violations, and dispatches webcam directives."""
+            selected_ips = [ip for ip, data in checkbox_registry.items() if data["variable"].get() == True]
+
+            if len(selected_ips) < 2:
+                lbl_status.config(
+                    text=f"INVALID SELECTION: CHOSE {len(selected_ips)} PCs. AT LEAST 2 REQUIRED TO START VC.", 
+                    fg=self.c_alert
+                )
+                return
+
+            # Update database status locally for all selected hosts immediately so UI doesn't delay
+            for ip in selected_ips:
+                other_peers = [p for p in selected_ips if p != ip]
+                if "network_database" in globals() and ip in network_database:
+                    network_database[ip]["vc_status"] = "in_vc"
+                    network_database[ip]["vc_peers"] = other_peers
+
+            lbl_status.config(text=f"ESTABLISHING VIDEO ROUTE AMONG {len(selected_ips)} HOSTS...", fg="#10B981")
+
+            payload = json.dumps({
+                "action": "setup_video_room",
+                "peers": selected_ips
+            }).encode('utf-8')
+            payload_len = len(payload)
+
+            def broadcast_worker():
+                for target_ip in selected_ips:
+                    try:
+                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                            s.settimeout(2.0)
+                            s.connect((target_ip, 6006))
+                            s.sendall(payload_len.to_bytes(4, byteorder='big'))
+                            s.sendall(payload)
+                    except:
+                        pass
+                
+                try:
+                    lbl_status.config(text="// VIDEO CALL REQUEST DISPATCHED SUCCESSFULLY", fg=self.c_accent)
+                except:
+                    pass
+
+            threading.Thread(target=broadcast_worker, daemon=True).start()
+
+        # Initialize the live background updating runtime loop instantly
+        rebuild_and_sync_roster()
+
+        # Single Main Button Core Frame Controller Layout
+        btn_start_vc = ctk.CTkButton(
+            vc_win, 
+            text="START VIDEO CALL MATRIX", 
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), 
+            fg_color="#10B981", 
+            hover_color="#059669", 
+            text_color="#FFFFFF",
+            height=40,
+            corner_radius=8,
+            command=initiate_video_broadcast
+        )
+        btn_start_vc.pack(fill=tk.X, padx=20, pady=20)
+        
     def trigger_network_refresh(self):
         """Asynchronously dispatches status requests to prevent UI lag."""
         import threading
@@ -689,7 +1052,7 @@ class LANMonitorGUI:
         """Spawns a styled deployment controller panel matching the design system."""
         deploy_win = ctk.CTkToplevel(self.root)
         deploy_win.title("NEXUS // FILE DEPLOYMENT SUB-SYSTEM")
-        deploy_win.geometry("580x420")
+        deploy_win.geometry("580x460") # Slightly increased height to accommodate the toggle
         deploy_win.configure(fg_color=self.c_bg)
         deploy_win.attributes("-topmost", True)
         deploy_win.resizable(False, False)
@@ -735,8 +1098,21 @@ class LANMonitorGUI:
             text_color=self.c_accent,
             placeholder_text=r"C:\Program Files\Agent_track"
         )
-        dest_path_entry.pack(fill=ctk.X, padx=20, pady=(4, 25))
+        dest_path_entry.pack(fill=ctk.X, padx=20, pady=(4, 15))
         dest_path_entry.insert(0, r"C:\Program Files\Agent_track") 
+
+        # --- NEW SECTION: AUTO-RUN EXECUTION TOGGLE ---
+        auto_run_var = tk.BooleanVar(value=False)
+        auto_run_check = ctk.CTkCheckBox(
+            wrapper, 
+            text="Execute immediately on remote endpoint upon landing (Auto-Run)",
+            variable=auto_run_var,
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            text_color=self.c_text_main,
+            fg_color="#3B82F6",
+            hover_color="#2563EB"
+        )
+        auto_run_check.pack(anchor="w", padx=20, pady=(0, 15))
 
         # --- SECTION 3: DEPLOYMENT EXECUTION CONTROL ---
         status_lbl = ctk.CTkLabel(wrapper, text="Status: Standby.", font=ctk.CTkFont(family="Segoe UI", size=11, slant="italic"), text_color=self.c_text_muted)
@@ -745,6 +1121,7 @@ class LANMonitorGUI:
         def trigger_mass_distribution():
             src = selected_file_path.get()
             dest = dest_path_entry.get().strip()
+            should_execute = auto_run_var.get()
             
             import os
             if not src or src == "No file selected..." or not os.path.exists(src):
@@ -757,9 +1134,9 @@ class LANMonitorGUI:
             status_lbl.configure(text="Status: Distributing packets...", text_color=self.c_accent)
             
             import threading
-            threading.Thread(target=execute_network_file_push, args=(src, dest, status_lbl), daemon=True).start()
+            threading.Thread(target=execute_network_file_push, args=(src, dest, should_execute, status_lbl), daemon=True).start()
 
-        def execute_network_file_push(local_file, remote_target_dir, feedback_ui_lbl):
+        def execute_network_file_push(local_file, remote_target_dir, auto_run_flag, feedback_ui_lbl):
             import socket
             import json
             import os
@@ -779,12 +1156,13 @@ class LANMonitorGUI:
 
             success_counter = 0
             
-            # Formulate clear instructions payload
+            # Formulate clear instructions payload dynamically mapped to UI checkbox context
             directive = {
                 "action": "drop_file",
                 "file_name": filename,
                 "file_size": file_size,
-                "target_directory": remote_target_dir
+                "target_directory": remote_target_dir,
+                "auto_run": auto_run_flag  # Dynamic execution context
             }
             directive_bytes = json.dumps(directive).encode('utf-8')
             directive_len = len(directive_bytes)
@@ -792,7 +1170,7 @@ class LANMonitorGUI:
             for target_ip in active_targets:
                 try:
                     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                        s.settimeout(6.0) # Expanded timeout threshold for massive binary uploads
+                        s.settimeout(6.0) 
                         s.connect((target_ip, 6006))
                         
                         s.sendall(directive_len.to_bytes(4, byteorder='big'))
@@ -819,7 +1197,7 @@ class LANMonitorGUI:
             command=trigger_mass_distribution
         )
         action_btn.pack(fill=ctk.X, padx=20, pady=(10, 10))
-        
+
     def get_device_signature(self, device_dict):
         """
         Generates a normalized, unique lookup key for a hardware device
