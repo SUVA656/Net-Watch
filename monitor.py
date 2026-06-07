@@ -8,6 +8,8 @@ import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk
 import customtkinter as ctk
+import datetime
+import time
 
 # Import the Drag and Drop modules
 from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -21,30 +23,107 @@ network_database = {}
 
 # Strict preservation of original length-prefixed socket background processing listener
 def start_agent_listener(update_callback):
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind(('0.0.0.0', AGENT_PORT))
-    server_socket.listen(10)
+    """
+    Listens for TCP telemetry data on port 5005.
+    Guarantees device registration by handling empty or partial payloads safely,
+    while preserving active states such as global chat room allocations.
+    """
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        server.bind(('0.0.0.0', 5005))
+        server.listen(50)
+    except Exception as e:
+        print(f"[CRITICAL] Failed to bind telemetry port 5005: {e}")
+        return
+
     while True:
         try:
-            client_sock, client_addr = server_socket.accept()
-            client_ip = client_addr[0]
+            sock, addr = server.accept()
+            client_ip = str(addr[0])
             
-            len_bytes = client_sock.recv(4)
-            if len_bytes and len(len_bytes) == 4:
-                size = int.from_bytes(len_bytes, byteorder='big')
-                buffer = b""
-                while len(buffer) < size:
-                    chunk = client_sock.recv(min(size - len(buffer), 4096))
-                    if not chunk: break
-                    buffer += chunk
-                
-                if len(buffer) == size:
-                    network_database[client_ip] = json.loads(buffer.decode('utf-8'))
+            # Read 4-byte payload length header
+            len_bytes = sock.recv(4)
+            if not len_bytes:
+                sock.close()
+                continue
+            payload_len = int.from_bytes(len_bytes, byteorder='big')
+            
+            # Stream the complete JSON array string
+            buffer = b""
+            while len(buffer) < payload_len:
+                chunk = sock.recv(min(payload_len - len(buffer), 4096))
+                if not chunk: break
+                buffer += chunk
+            sock.close()
+
+            if len(buffer) == payload_len:
+                try:
+                    payload = json.loads(buffer.decode('utf-8', errors='ignore'))
+                except Exception:
+                    # Fallback dataset if the JSON parsing corrupts
+                    payload = {}
+
+                if payload.get("action") == "agent_exit_chat":
+                    if client_ip in network_database:
+                        network_database[client_ip]["chat_status"] = "idle"
                     update_callback()
-            client_sock.close()
-        except Exception:
-            pass
+                    continue # Skip regular telemetry compilation for this control packet
+
+                # Fill default values defensively so UI rendering NEVER crashes
+                if "hostname" not in payload: payload["hostname"] = "WORKSTATION"
+                if "os" not in payload: payload["os"] = "Windows 10/11"
+                if "ram" not in payload: payload["ram"] = "Unknown RAM"
+                if "cpu" not in payload: payload["cpu"] = "Unknown CPU"
+                if "history" not in payload: payload["history"] = []
+                if "devices" not in payload: payload["devices"] = []
+                
+                # --- CHAT STATE PERSISTENCE CORE ---
+                # Check if this endpoint has a historical state in our running database
+                if client_ip in network_database and isinstance(network_database[client_ip], dict):
+                    # Extract its current chat state so it isn't erased
+                    existing_chat = network_database[client_ip].get("chat_status", "idle")
+                    payload["chat_status"] = existing_chat
+                else:
+                    # Brand-new endpoint joining the grid; mark it idle
+                    payload["chat_status"] = "idle"
+                
+                # Enforce state rules for the Chat Selector window lookups
+                payload["status"] = "ACTIVE"
+                payload["last_seen"] = datetime.datetime.now()
+                payload["is_active"] = True
+                
+                # Commit cleanly to global state without losing chat history data
+                network_database[client_ip] = payload
+                
+                # Force Tkinter thread to repaint UI list instantly
+                update_callback()
+        except Exception as e:
+            print(f"[DEBUG ERROR] Listener thread anomaly: {e}")
+
+def active_device_sweeper(update_callback):
+    """
+    Scans network data states every 2 seconds. Switches flag states 
+    to False if an agent drops offline, triggering a safe UI list update.
+    """
+    while True:
+        time.sleep(2)
+        now = datetime.datetime.now()
+        state_changed = False
+        
+        # Cast to list to avoid runtime dictionary sizing errors
+        for client_ip, dataset in list(network_database.items()):
+            last_timestamp = dataset.get("last_seen")
+            if last_timestamp:
+                elapsed = (now - last_timestamp).total_seconds()
+                # If an agent misses connections for over 15 seconds, flag it offline
+                if elapsed > 15:
+                    if dataset.get("is_active", True) is True:
+                        dataset["is_active"] = False
+                        state_changed = True
+                        
+        if state_changed:
+            update_callback()
 
 
 class RemoteSessionWindow:
@@ -311,35 +390,45 @@ class LANMonitorGUI:
         self.main_container.pack(fill=ctk.BOTH, expand=True, padx=25, pady=25)
         # Add the Broadcast Action Button in your header container layout
         # (Ensure this parent container matches where your existing dashboard headers are declared)
-        self.btn_broadcast = ctk.CTkButton(
-            self.root, # Swap with self.header_frame or equivalent wrapper if available
-            text="⚠️ BROADCAST MESSAGE",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            fg_color="#DF2E38", 
-            hover_color="#A41921",
+        # Create the container frame for the two side-by-side buttons
+        button_container_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+
+        # 1. New Chat Manager Button placed on the left side
+        self.btn_chat_mgr = ctk.CTkButton(
+            button_container_frame,
+            text="🗨️CHAT MANAGER",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            fg_color="#10B981",
+            hover_color="#059669",
             text_color="#FFFFFF",
-            width=160,
-            height=32,
-            corner_radius=6,
+            height=36,
+            command=self.open_chat_management_window
+        )
+        self.btn_chat_mgr.pack(side=tk.LEFT, expand=True, fill=ctk.X, padx=(0, 5))
+
+        # 2. FIXED: Keeps your original variable name 'self.btn_broadcast' intact
+        self.btn_broadcast = ctk.CTkButton(
+            button_container_frame,
+            text="⚠️ BROADCAST SYSTEM ALERT",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            fg_color="#EF4444",
+            hover_color="#DC2626",
+            text_color="#FFFFFF",
+            height=36,
             command=self.open_broadcast_window
         )
-        
-        # Place it cleanly in the top-right corner of your grid/frame layout configuration
-        self.btn_broadcast.place(relx=1.0, rely=0.02, anchor="ne", x=-20)
+        self.btn_broadcast.pack(side=tk.LEFT, expand=True, fill=ctk.X, padx=(5, 0))
+
+        # Instead of packing the individual buttons directly to self.root, 
+        # we place the entire container exactly where your old broadcast button went!
+        button_container_frame.place(relx=1.0, rely=0.02, anchor="ne", x=-20)
 
         # --- HIGH-END SYSTEM-MATCHED TREEVIEW DESIGN SPECIFICATION ---
         style = ttk.Style()
         style.theme_use("clam")
         
         # Configure the core inner data row workspace grid Matrix
-        style.configure(
-            "Treeview", 
-            background=self.c_inner,       # Custom dark slate inner container color (#1B2332)
-            foreground=self.c_text_main,   # Off-white crisp text main color (#F5F6F9)
-            fieldbackground=self.c_inner,  # Solid background matching inner container filling
-            rowheight=32,                  # Expanded row padding height for optimal scannability
-            font=("Segoe UI", 11)          # Custom font tracking configuration matching GUI layout
-        )
+        style.configure("Treeview",background=self.c_inner,foreground=self.c_text_main,fieldbackground=self.c_inner,rowheight=32,font=("Segoe UI", 11),borderwidth=0,relief="flat")
         
         # Configure the top Sticky Column Headers Matrix
         style.configure(
@@ -360,30 +449,28 @@ class LANMonitorGUI:
         # Overwrite legacy styling components to strip native layout borders
         style.configure("Treeview", borderwidth=0, highlightthickness=0)
         style.layout("Treeview", [('Treeview.treearea', {'sticky': 'nswe'})]) # Strips default hard white outer padding rules
+        style.configure("Treeview.Heading", borderwidth=0)
 
         # =====================================================================
         # 1. FAR LEFT COLUMN: MANAGE ENDPOINTS LIST
         # =====================================================================
-        self.endpoints_frame = ctk.CTkFrame(self.main_container, fg_color=self.c_card, width=280, corner_radius=16)
+        self.endpoints_frame = ctk.CTkFrame(self.main_container, fg_color=self.c_card, width=320, corner_radius=16)
         self.endpoints_frame.pack(side=ctk.LEFT, fill=ctk.Y)
         self.endpoints_frame.pack_propagate(False)
 
-        ctk.CTkLabel(
-            self.endpoints_frame, text="MANAGE ENDPOINTS", 
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color=self.c_accent
-        ).pack(anchor="w", padx=20, pady=(20, 12))
-
         self.listbox_container = ctk.CTkFrame(self.endpoints_frame, fg_color=self.c_inner, corner_radius=12, border_width=1, border_color=self.c_border)
-        self.listbox_container.pack(fill=ctk.BOTH, expand=True, padx=15, pady=(0, 20))
+        self.listbox_container.pack(fill=ctk.BOTH, expand=True, padx=15, pady=(20, 20))
 
-        self.device_listbox = tk.Listbox(
-            self.listbox_container, bg=self.c_inner, fg=self.c_accent, bd=0,
-            highlightthickness=0, font=("Consolas", 10, "bold"),
-            selectbackground="#1e3a8a", selectforeground="#00F0FF"
+        self.device_container = ctk.CTkScrollableFrame(
+            self.listbox_container,
+            fg_color="transparent",
+            label_text="MANAGED ENDPOINTS",
+            label_font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold")
         )
-        self.device_listbox.pack(fill=ctk.BOTH, expand=True, padx=10, pady=10)
-        self.device_listbox.bind('<<ListboxSelect>>', self.on_device_select)
+        self.device_container.pack(fill=ctk.BOTH, expand=True, padx=5, pady=5)
 
+        # Track the currently selected IP explicitly as a class variable string
+        self.selected_device_ip = None
         # =====================================================================
         # RIGHT HAND SIDE CONTAINER
         # =====================================================================
@@ -407,6 +494,19 @@ class LANMonitorGUI:
         self.workspace_detail_view.pack(fill=ctk.BOTH, expand=True)
         
         self.build_interactive_detail_panes()
+
+    def get_device_signature(self, device_dict):
+        """
+        Generates a normalized, unique lookup key for a hardware device
+        by combining its core properties and stripping white spaces/casing.
+        """
+        if not device_dict:
+            return ""
+        dev_name = str(device_dict.get("name", "")).strip().upper()
+        dev_type = str(device_dict.get("type", "")).strip().upper()
+        raw_id = str(device_dict.get("raw_id", "")).strip().upper()
+        
+        return f"{dev_type}_{dev_name}_{raw_id}"
 
     def update_browsing_history_display(self, raw_history_data):
         if not hasattr(self, 'history_table'):
@@ -448,7 +548,7 @@ class LANMonitorGUI:
         self.flex_row.pack(fill=ctk.X)
 
         self.specs_labels = {}
-        fields_definitions = ["IP Address", "Device Name", "Operating System", "Memory (RAM)", "Processor"]
+        fields_definitions = ["IP Address","Device Name","Operating System","Memory (RAM)","Processor","MAC Address"]
         
         for field in fields_definitions:
             item_capsule = ctk.CTkFrame(self.flex_row, fg_color=self.c_inner, corner_radius=25, border_width=1, border_color=self.c_border)
@@ -472,7 +572,7 @@ class LANMonitorGUI:
             ("history", "🕒  Browsing History"),
             ("hardware", "🛡️  Connected Hardware"),
             ("remote", "🖥️  Remote Live Session"),
-            ("notify", "💬  Notification Engine")
+            ("notify", "🔔  Notification Engine")
         ]
 
         for key, text in tab_definitions:
@@ -487,14 +587,23 @@ class LANMonitorGUI:
 
     def build_interactive_detail_panes(self):
         # -----------------------------------------------------------------
+        # -----------------------------------------------------------------
         # PANE 1: BROWSING HISTORY LOG GRID
         # -----------------------------------------------------------------
-        self.history_frame = ctk.CTkFrame(self.workspace_detail_view, fg_color=self.c_card, corner_radius=16)
-        inner_hist = ctk.CTkFrame(self.history_frame, fg_color="transparent")
-        inner_hist.pack(fill=ctk.BOTH, expand=True, padx=20, pady=20)
+
+        self.history_frame = ctk.CTkFrame(self.workspace_detail_view,fg_color=self.c_card,corner_radius=22)
+
+        # OUTER PADDING LAYER
+        outer_pad = ctk.CTkFrame(self.history_frame,fg_color="transparent")
+        outer_pad.pack(fill=ctk.BOTH, expand=True, padx=12, pady=12)
+
+        # INNER ROUNDED CONTAINER
+        inner_hist = ctk.CTkFrame(outer_pad,fg_color=self.c_inner,corner_radius=18)
+        inner_hist.pack(fill=ctk.BOTH, expand=True)
 
         columns = ("url", "timestamp")
-        self.history_table = ttk.Treeview(inner_hist, columns=columns, show="headings", style="Treeview")
+
+        self.history_table = ttk.Treeview(inner_hist,columns=columns,show="headings",style="Treeview")
 
         self.history_table.heading("url", text="URL / Website Address")
         self.history_table.heading("timestamp", text="Time Stamp")
@@ -502,11 +611,13 @@ class LANMonitorGUI:
         self.history_table.column("url", anchor=tk.NW, width=500, minwidth=250)
         self.history_table.column("timestamp", anchor=tk.CENTER, width=110, minwidth=90)
 
-        scrollbar = ctk.CTkScrollbar(inner_hist, orientation="vertical", command=self.history_table.yview)
+        scrollbar = ctk.CTkScrollbar(inner_hist,orientation="vertical",command=self.history_table.yview)
+
         self.history_table.configure(yscrollcommand=scrollbar.set)
 
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.history_table.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT,fill=tk.Y,padx=(0, 8),pady=8)
+
+        self.history_table.pack(side=tk.LEFT,fill=tk.BOTH,expand=True,padx=(8, 0),pady=8)
         # --------------------------------------------------------
 
         # Note: Your original raw text widget string parser line (self.tree) 
@@ -634,27 +745,125 @@ class LANMonitorGUI:
                 btn.configure(fg_color=self.c_card, text_color=self.c_text_muted)
 
     def refresh_current_selection_data(self):
-        current_selection = self.device_listbox.curselection()
-        if current_selection:
-            selected_txt = self.device_listbox.get(current_selection[0])
-            ip = selected_txt.split(" // ")[1].split(" ")[0]
-            self.update_data_panes(ip)
+        """
+        Refreshes data panes based on the explicitly tracked 
+        selected IP string instead of legacy listbox item positions.
+        """
+        # --- FIX: Read directly from the class pointer instead of self.device_listbox ---
+        if hasattr(self, 'selected_device_ip') and self.selected_device_ip:
+            self.update_data_panes(self.selected_device_ip)
+        else:
+            # Fallback handling if no client device has been selected yet
+            for item in self.history_table.get_children():
+                self.history_table.delete(item)
+            self.lbl_node_title.configure(text="// ENDPOINT_MONITOR : STANDBY")
 
+            
     def refresh_device_list(self):
-        self.root.after(0, self._update_ui)
+        """Thread-safe caller wrapper that safely schedules a UI update execution."""
+        if hasattr(self, 'root') and self.root:
+            self.root.after(0, self._update_ui)
 
     def _update_ui(self):
-        current_selection = self.device_listbox.curselection()
-        selected_ip = None
-        if current_selection:
-            selected_txt = self.device_listbox.get(current_selection[0])
-            selected_ip = selected_txt.split(" // ")[1].split(" ")[0]
+        """
+        Upgraded UI renderer. Replaces old mono-color listbox items 
+        with vibrant, multi-colored custom element asset cards.
+        """
+        # 1. Clear out all existing row widgets from the container
+        for child in self.device_container.winfo_children():
+            child.destroy()
 
-        self.device_listbox.delete(0, tk.END)
-        for idx, (ip, data) in enumerate(network_database.items()):
-            self.device_listbox.insert(tk.END, f" NODE // {ip} ({data.get('hostname')})")
-            if ip == selected_ip: self.device_listbox.selection_set(idx)
-        if selected_ip: self.update_data_panes(selected_ip)
+        if not network_database:
+            placeholder = ctk.CTkLabel(
+                self.device_container, 
+                text="Waiting for corporate agent check-ins...", 
+                font=ctk.CTkFont(family="Segoe UI", size=12, italic=True),
+                text_color=self.c_text_muted if hasattr(self, 'c_text_muted') else "#888888"
+            )
+            placeholder.pack(pady=20)
+            return
+
+        # 2. Rebuild the device deck dynamically
+        for ip, data in network_database.items():
+            is_active = data.get("is_active", True)
+            hostname = data.get("hostname", "WORKSTATION")
+            
+            # Establish explicit color rules independently from the text font color
+            badge_color = "#22c55e" if is_active else "#ef4444" # Vivid Green vs Corporate Red
+            arrow_symbol = "" if is_active else ""
+            status_text = "ACTIVE" if is_active else "OFFLINE"
+            
+            # Determine card background style if this specific device is clicked/selected
+            is_selected = (ip == self.selected_device_ip)
+            if is_selected:
+                card_bg = self.c_inner if hasattr(self, 'c_inner') else "#2b2b2b"
+                border_color = self.c_accent if hasattr(self, 'c_accent') else "#1f6aa5"
+            else:
+                card_bg = self.c_card if hasattr(self, 'c_card') else "#212121"
+                border_color = self.c_border if hasattr(self, 'c_border') else "#333333"
+
+            # Create the clickable base container card for the device row
+            row_card = ctk.CTkFrame(
+                self.device_container, 
+                fg_color=card_bg, 
+                border_color=border_color, 
+                border_width=1, 
+                height=42, 
+                corner_radius=6,
+                cursor="hand2"
+            )
+            row_card.pack(fill=ctk.X, pady=4, padx=2)
+            row_card.pack_propagate(False)
+
+            # A. The Dot & Arrow Indicator (Vibrant Colored Component)
+            lbl_indicator = ctk.CTkLabel(
+                row_card, 
+                text=f"● {arrow_symbol}", 
+                font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                text_color=badge_color
+            )
+            lbl_indicator.pack(side=tk.LEFT, padx=(12, 4))
+
+            # B. System Details String (Standard Main Text Font Color)
+            display_details = f"{ip}  ({hostname})"
+            lbl_details = ctk.CTkLabel(
+                row_card, 
+                text=display_details, 
+                font=ctk.CTkFont(family="Segoe UI", size=12, weight="normal"),
+                text_color=self.c_text_main if hasattr(self, 'c_text_main') else "#ffffff"
+            )
+            lbl_details.pack(side=tk.LEFT, padx=6)
+
+            # C. Inactive/Active Right-Aligned Badge Tag
+            lbl_status_tag = ctk.CTkLabel(
+                row_card,
+                text=status_text,
+                font=ctk.CTkFont(family="Consolas", size=10, weight="bold"),
+                text_color=badge_color
+            )
+            lbl_status_tag.pack(side=tk.RIGHT, padx=12)
+
+            # 3. Bind the mouse-click action across all child elements inside the row card
+            # This ensures clicking anywhere on the row registers the selection perfectly
+            bind_selection = lambda e, target_ip=ip: self.select_device_endpoint(target_ip)
+            row_card.bind("<Button-1>", bind_selection)
+            lbl_indicator.bind("<Button-1>", bind_selection)
+            lbl_details.bind("<Button-1>", bind_selection)
+            lbl_status_tag.bind("<Button-1>", bind_selection)
+    
+        if hasattr(self, 'chat_mgr_win') and self.chat_mgr_win and self.chat_mgr_win.winfo_exists():
+            self.refresh_chat_matrix_list()
+
+
+    def select_device_endpoint(self, ip):
+        """Sets the active system focus pointer and updates side panels instantly."""
+        self.selected_device_ip = ip
+        
+        # Redraw the device panel deck to update highlight border frames dynamically
+        self._update_ui()
+        
+        # Repopulate hardware specifications, histories, or stream server sockets downstream
+        self.update_data_panes(ip)
 
     def on_device_select(self, event):
         self.selected_hardware_index = None
@@ -671,27 +880,89 @@ class LANMonitorGUI:
 
     def update_data_panes(self, ip):
         data = network_database.get(ip)
-        if not data: return
-        self.specs_labels["IP Address"].configure(text=ip)
-        self.specs_labels["Device Name"].configure(text=str(data.get('hostname')))
-        self.specs_labels["Operating System"].configure(text=str(data.get('os')))
-        self.specs_labels["Memory (RAM)"].configure(text=str(data.get('ram')))
-        self.specs_labels["Processor"].configure(text=str(data.get('cpu')))
+        if not data: 
+            return
+            
+        is_active = data.get("is_active", True)
+        
+        # --- 1. SAFE DATA PANELS EXTRACTION & ASSIGNMENTS ---
+        if "IP Address" in self.specs_labels:
+            self.specs_labels["IP Address"].configure(text=ip)
+            
+        if "Device Name" in self.specs_labels:
+            self.specs_labels["Device Name"].configure(text=str(data.get('hostname')))
+            
+        if "Operating System" in self.specs_labels:
+            self.specs_labels["Operating System"].configure(text=str(data.get('os')))
+        
+        # Pull MAC address string safely (Supports both common payload naming structures)
+        mac_address = str(data.get('mac', data.get('mac_address', 'N/A'))).strip()
+
+        # COMPACT FIT CONFIGURATION: Ensure labels wrap nicely without ruining layout alignment
+        for label_key in ["Operating System", "Memory (RAM)", "Processor", "MAC Address"]:
+            if label_key in self.specs_labels:
+                self.specs_labels[label_key].configure(wraplength=200, justify="left")
+
+        # --- 2. OFFLINE STANDBY STATE OVERRIDES ---
+        if not is_active:
+            # Mask hardware variables cleanly when the endpoint drops off the matrix
+            if "Memory (RAM)" in self.specs_labels:
+                self.specs_labels["Memory (RAM)"].configure(text="Unavailable (Offline)")
+            if "Processor" in self.specs_labels:
+                self.specs_labels["Processor"].configure(text="Unavailable (Offline)")
+            if "MAC Address" in self.specs_labels:
+                self.specs_labels["MAC Address"].configure(text="Unavailable (Offline)")
+                
+            self.lbl_node_title.configure(text=f"// DATA FEED: SYSTEM_NODE_{ip} [DISCONNECTED]")
+            self.active_remote_ip = None 
+
+            # Wipe table frames
+            for item in self.history_table.get_children():
+                self.history_table.delete(item)
+                
+            for child in self.hw_scroll_container.winfo_children():
+                child.destroy()
+                
+            placeholder = ctk.CTkLabel(
+                self.hw_scroll_container, 
+                text="Telemetry disconnected. Cannot pull asset profiles.", 
+                font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), 
+                text_color=self.c_alert
+            )
+            placeholder.pack(pady=20)
+            
+            # Recalculate layout for the offline placeholder message
+            self.root.update_idletasks()
+            if hasattr(self.hw_scroll_container, "_update_scrollbar"):
+                self.hw_scroll_container._update_scrollbar()
+            return  
+            
+        # --- 3. ACTIVE LIVE TELEMETRY STATE POPULATION ---
+        if "Memory (RAM)" in self.specs_labels:
+            self.specs_labels["Memory (RAM)"].configure(text=str(data.get('ram')))
+            
+        if "Processor" in self.specs_labels:
+            self.specs_labels["Processor"].configure(text=str(data.get('cpu')))
+            
+        if "MAC Address" in self.specs_labels:
+            # FIX: Force continuous hex strings to break into double stack columns so it fits compact UI tiles
+            if len(mac_address) > 12 and " " not in mac_address:
+                formatted_mac = f"{mac_address[:9]}\n{mac_address[9:]}"
+            else:
+                formatted_mac = mac_address
+            self.specs_labels["MAC Address"].configure(text=formatted_mac)
+            
         self.lbl_node_title.configure(text=f"// DATA FEED: SYSTEM_NODE_{ip}")
         self.active_remote_ip = ip
 
         # --- TABULAR BROWSING HISTORY VIEWER ---
         if self.current_view == "history":
-            # Wipe out old entries cleanly first so they don't stack up on re-selection
             for item in self.history_table.get_children():
                 self.history_table.delete(item)
                 
-            # Loop through incoming history objects and drop them into explicit columns
             for item in data.get("history", []):
-                site_url = str(item.get('site', 'N/A')).strip()# Safely extract date metric if present
-                timestamp = str(item.get('ip', 'N/A')).strip()   # Maps back to your timestamp JSON payload key
-                
-                # Insert directly as a structured multi-column row unit
+                site_url = str(item.get('site', 'N/A')).strip() 
+                timestamp = str(item.get('ip', 'N/A')).strip()   
                 self.history_table.insert("", tk.END, values=(site_url, timestamp))
             
         # --- SINGLE-ROW SELECTION HARDWARE INTERFACE ---
@@ -700,26 +971,87 @@ class LANMonitorGUI:
                 child.destroy()
                 
             self.hardware_row_widgets = []
-            devices_list = data.get("devices", [])
+            raw_devices = data.get("devices", [])
             
-            if not devices_list:
+            if not raw_devices:
                 placeholder = ctk.CTkLabel(self.hw_scroll_container, text="No active peripheral channels reported.", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color=self.c_text_muted)
                 placeholder.pack(pady=20)
             else:
+                BLOCKABLE_CLASSES = {"KEYBOARD", "MOUSE", "DISKDRIVE", "PRINTER", "PRINTQUEUE", "CAMERA", "IMAGE"}
+                blockable_devices = []
+                non_blockable_devices = []
+                
+                for dev in raw_devices:
+                    dev_type = str(dev.get("type", "GENERIC")).strip().upper()
+                    dev_name = str(dev.get("name", "")).strip().upper()
+                    raw_id = str(dev.get("raw_id", "")).strip().upper()
+                    
+                    if "MICROSOFT" in dev_name or "ONENOTE" in dev_name or "PDF" in dev_name or "XPS" in dev_name:
+                        is_blockable = False
+                    elif "ROOT" in dev_name or "CONTROLLER" in dev_name or "ROOT" in raw_id:
+                        is_blockable = False
+                    elif dev_type == "DISKDRIVE":
+                        if "USBSTOR" in raw_id or "USB" in raw_id:
+                            is_blockable = True
+                        else:
+                            is_blockable = False 
+                    else:
+                        is_blockable = dev_type in BLOCKABLE_CLASSES
+
+                    if is_blockable:
+                        blockable_devices.append(dev)
+                    else:
+                        non_blockable_devices.append(dev)
+                
+                devices_list = blockable_devices + non_blockable_devices
+                data["devices"] = devices_list
+
+                if not hasattr(self, 'selected_device_id_key'):
+                    self.selected_device_id_key = None
+
+                def handle_hardware_click(event, target_device):
+                    # FIX: Uses the unified signature engine method so event assignments match perfectly
+                    self.selected_device_id_key = self.get_device_signature(target_device)
+                    try:
+                        actual_idx = data["devices"].index(target_device)
+                        self.highlight_hardware_row(actual_idx)
+                    except ValueError:
+                        pass
+
                 for idx, dev in enumerate(devices_list):
+                    dev_type = str(dev.get("type", "GENERIC")).strip().upper()
+                    dev_name = str(dev.get("name", "")).strip().upper()
+                    raw_id = str(dev.get("raw_id", "")).strip().upper()
+                    
+                    if "MICROSOFT" in dev_name or "ONENOTE" in dev_name or "PDF" in dev_name or "XPS" in dev_name:
+                        row_is_blockable = False
+                    elif "ROOT" in dev_name or "CONTROLLER" in dev_name or "ROOT" in raw_id:
+                        row_is_blockable = False
+                    elif dev_type == "DISKDRIVE":
+                        row_is_blockable = "USBSTOR" in raw_id or "USB" in raw_id
+                    else:
+                        row_is_blockable = dev_type in BLOCKABLE_CLASSES
+                    
+                    # FIX: Normalizes row strings casing context matching via helper function mapping
+                    current_dev_sig = self.get_device_signature(dev)
+
                     row_card = ctk.CTkFrame(self.hw_scroll_container, fg_color=self.c_card, height=48, corner_radius=8, border_width=1, border_color=self.c_border, cursor="hand2")
                     row_card.pack(fill=ctk.X, pady=4, padx=5)
                     row_card.pack_propagate(False)
                     
                     self.hardware_row_widgets.append(row_card)
                     
-                    # Extract Status Variable Metric (Defaults safely to ACTIVE if missing)
-                    dev_status = str(dev.get("status", "ACTIVE")).strip().upper()
-                    status_color = "#22c55e" if dev_status == "ACTIVE" else self.c_alert
-                    
-                    # Connection State Indicator dot mapping the status color
-                    status_dot = ctk.CTkFrame(row_card, width=10, height=10, corner_radius=5, fg_color=status_color)
-                    status_dot.pack(side=tk.LEFT, padx=(15, 5))
+                    if row_is_blockable:
+                        dev_status = str(dev.get("status", "ACTIVE")).strip().upper()
+                        status_color = "#22c55e" if dev_status == "ACTIVE" else self.c_alert
+                        
+                        status_dot = ctk.CTkFrame(row_card, width=10, height=10, corner_radius=5, fg_color=status_color)
+                        status_dot.pack(side=tk.LEFT, padx=(15, 5))
+                        status_dot.bind("<Button-1>", lambda e, d=dev: handle_hardware_click(e, d))
+                    else:
+                        status_spacer = ctk.CTkFrame(row_card, width=10, height=10, fg_color="transparent")
+                        status_spacer.pack(side=tk.LEFT, padx=(15, 5))
+                        status_spacer.bind("<Button-1>", lambda e, d=dev: handle_hardware_click(e, d))
                     
                     lbl_name = ctk.CTkLabel(
                         row_card, text=f"{str(dev.get('name'))}",
@@ -728,33 +1060,34 @@ class LANMonitorGUI:
                     )
                     lbl_name.pack(side=tk.LEFT, padx=10)
                     
-                    # RIGHT-ALIGNED BADGES MATRIX
-                    # 1. State Status Badge (ACTIVE / BLOCKED)
-                    status_badge = ctk.CTkLabel(
-                        row_card, text=dev_status,
-                        font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
-                        text_color="#ffffff", fg_color=status_color, corner_radius=6, width=75, height=24
-                    )
-                    status_badge.pack(side=tk.RIGHT, padx=15)
+                    if row_is_blockable:
+                        status_badge = ctk.CTkLabel(
+                            row_card, text=dev_status,
+                            font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+                            text_color="#ffffff", fg_color=status_color, corner_radius=6, width=75, height=24
+                        )
+                        status_badge.pack(side=tk.RIGHT, padx=15)
+                        status_badge.bind("<Button-1>", lambda e, d=dev: handle_hardware_click(e, d))
                     
-                    # 2. Hardware Subsystem Class Type Badge
                     type_badge = ctk.CTkLabel(
-                        row_card, text=str(dev.get('type', 'GENERIC')).upper(),
+                        row_card, text=dev_type,
                         font=ctk.CTkFont(family="Consolas", size=10, weight="bold"),
                         text_color=self.c_accent, fg_color=self.c_inner, corner_radius=6, width=95, height=24
                     )
-                    type_badge.pack(side=tk.RIGHT, padx=5)
+                    type_badge.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
 
-                    # Event map clicks securely to pick single elements
-                    bind_cmd = lambda e, i=idx: self.highlight_hardware_row(i)
-                    row_card.bind("<Button-1>", bind_cmd)
-                    lbl_name.bind("<Button-1>", bind_cmd)
-                    status_dot.bind("<Button-1>", bind_cmd)
-                    type_badge.bind("<Button-1>", bind_cmd)
-                    status_badge.bind("<Button-1>", bind_cmd)
-                
-                if self.selected_hardware_index is not None and self.selected_hardware_index < len(devices_list):
-                    self.highlight_hardware_row(self.selected_hardware_index)
+                    row_card.bind("<Button-1>", lambda e, d=dev: handle_hardware_click(e, d))
+                    lbl_name.bind("<Button-1>", lambda e, d=dev: handle_hardware_click(e, d))
+                    type_badge.bind("<Button-1>", lambda e, d=dev: handle_hardware_click(e, d))
+                    
+                    if self.selected_device_id_key == current_dev_sig:
+                        self.highlight_hardware_row(idx)
+
+            # === CRITICAL GEOMETRY RECALCULATION SYNC ===
+            # Force processing of dynamic widget allocations and un-collapse the CustomTkinter canvas
+            self.root.update_idletasks()
+            if hasattr(self.hw_scroll_container, "_update_scrollbar"):
+                self.hw_scroll_container._update_scrollbar()
 
     def _render_canvas_frame(self, pil_image):
         """Executes safely on the main Tkinter thread context via .after()"""
@@ -941,6 +1274,121 @@ class LANMonitorGUI:
         )
         btn_send.pack(fill=ctk.X, padx=20, pady=5)
 
+    def open_chat_management_window(self):
+        """Spawns the enlarged chat management control frame and binds a dynamic refresher."""
+        if hasattr(self, 'chat_mgr_win') and self.chat_mgr_win and self.chat_mgr_win.winfo_exists():
+            self.chat_mgr_win.lift()
+            return
+
+        self.chat_mgr_win = ctk.CTkToplevel(self.root)
+        self.chat_mgr_win.title("GLOBAL CHAT ORCHESTRATOR")
+        
+        # --- INCREASED WINDOW GEOMETRY DIMENSIONS ---
+        self.chat_mgr_win.geometry("550x500") 
+        self.chat_mgr_win.resizable(False, False)
+        self.chat_mgr_win.attributes("-topmost", True)
+        self.chat_mgr_win.configure(fg_color=self.c_inner)
+        
+        lbl_title = ctk.CTkLabel(
+            self.chat_mgr_win, 
+            text="// ACTIVE CHAT MATRIX ROUTER", 
+            font=ctk.CTkFont(family="Consolas", size=13, weight="bold"), 
+            text_color=self.c_accent
+        )
+        lbl_title.pack(anchor=tk.W, padx=25, pady=(20, 10))
+
+        # --- EXPANDED INTERNAL SCROLLABLE CONTAINER SIZE ---
+        self.chat_scroll_frame = ctk.CTkScrollableFrame(self.chat_mgr_win, width=500, height=330)
+        self.chat_scroll_frame.pack(padx=25, pady=5, fill=tk.BOTH, expand=True)
+        
+        self.chat_checkbox_references = {}
+
+        # Initial populate call to draw checkboxes when opened
+        self.refresh_chat_matrix_list()
+
+        def dispatch_chat_session():
+            selected_ips = [ip for ip, cb in self.chat_checkbox_references.items() if cb.get() == 1]
+            if len(selected_ips) < 2:
+                tk.messagebox.showwarning("Routing Scope", "A chat room requires at least 2 active endpoints checked.")
+                return
+
+            participants_label = "in chat with " + ", ".join(selected_ips)
+            chat_init_payload = {
+                "action": "setup_chat_room",
+                "peers": selected_ips
+            }
+
+            for target_ip in selected_ips:
+                if target_ip in network_database:
+                    network_database[target_ip]["chat_status"] = participants_label
+                    self.dispatch_command_packet(target_ip, chat_init_payload)
+
+            self.update_data_panes(self.active_remote_ip)
+            self.chat_mgr_win.destroy()
+
+        btn_start = ctk.CTkButton(
+            self.chat_mgr_win,
+            text="START CHAT SESSION",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            fg_color="#10B981",
+            hover_color="#059669",
+            height=42, # Made slightly chunkier to match the scale
+            command=dispatch_chat_session
+        )
+        btn_start.pack(fill=ctk.X, padx=25, pady=20)
+
+    def refresh_chat_matrix_list(self):
+        """Wipes and completely regenerates the checkbox listing while preserving active selections."""
+        if not hasattr(self, 'chat_mgr_win') or not self.chat_mgr_win or not self.chat_mgr_win.winfo_exists():
+            return
+
+        # --- STEP 1: SAVE CURRENT CHECKBOX STATES ---
+        saved_selections = {}
+        if hasattr(self, 'chat_checkbox_references'):
+            for ip, cb in self.chat_checkbox_references.items():
+                try:
+                    saved_selections[ip] = cb.get()  # Stores 1 if checked, 0 if unchecked
+                except:
+                    pass
+
+        # Destroy old checkboxes inside scroll container to prevent overlaps
+        for widget in self.chat_scroll_frame.winfo_children():
+            widget.destroy()
+
+        self.chat_checkbox_references.clear()
+
+        # Scan running runtime database matrix
+        for ip, info in network_database.items():
+            if not info or not isinstance(info, dict):
+                continue
+                
+            status = str(info.get("status", "ACTIVE")).strip().upper()
+            if status == "OFFLINE":
+                continue
+                
+            hostname = info.get("hostname", f"Endpoint-{ip}")
+            
+            if "chat_status" not in info:
+                info["chat_status"] = "idle"
+                
+            current_chat_state = str(info.get("chat_status", "idle")).strip().lower()
+            display_label = f"{hostname} ({ip}) - [{current_chat_state.upper()}]"
+            is_busy = "in chat" in current_chat_state
+            
+            chk = ctk.CTkCheckBox(
+                self.chat_scroll_frame, 
+                text=display_label,
+                font=ctk.CTkFont(family="Segoe UI", size=11),
+                state="disabled" if is_busy else "normal"
+            )
+            chk.pack(anchor=tk.W, padx=10, pady=5)
+            
+            # --- STEP 2: RESTORE SELECTION STATE ---
+            if not is_busy:
+                self.chat_checkbox_references[ip] = chk
+                if ip in saved_selections and saved_selections[ip] == 1:
+                    chk.select()  # Re-check it automatically!
+
     def dispatch_command_packet(self, target_ip, data_dict):
         if not target_ip: return
         def worker():
@@ -960,7 +1408,7 @@ class LANMonitorGUI:
     def execute_smart_hardware_action(self, process_type):
         if not self.active_remote_ip: return
         
-        if self.selected_hardware_index is None:
+        if not hasattr(self, 'selected_device_id_key') or self.selected_device_id_key is None:
             tk.messagebox.showwarning("Selection Required", "Please click on a specific device row item from the connection grid list first.")
             return
 
@@ -968,15 +1416,43 @@ class LANMonitorGUI:
         if not data or not data.get("devices"): return
 
         devices_list = data.get("devices", [])
-        if self.selected_hardware_index >= len(devices_list): return
         
-        target_dev = devices_list[self.selected_hardware_index]
+        target_dev = None
+        for dev in devices_list:
+            # FIX: Use the new unified casing generator method so signature lookups match perfectly
+            if self.get_device_signature(dev) == self.selected_device_id_key:
+                target_dev = dev
+                break
+
+        if target_dev is None:
+            tk.messagebox.showerror("Sync Error", "Selected hardware is no longer reported by the target machine.")
+            return
+
+        # Double-check blockable status right before sending command packets
+        check_name = str(target_dev.get("name", "")).upper()
+        check_type = str(target_dev.get("type", "")).upper()
+        check_id = str(target_dev.get("raw_id", "")).upper()
+        
+        is_actionable = True
+        if "MICROSOFT" in check_name or "ONENOTE" in check_name or "PDF" in check_name or "XPS" in check_name:
+            is_actionable = False
+        elif "ROOT" in check_name or "CONTROLLER" in check_name or "ROOT" in check_id:
+            is_actionable = False
+        elif check_type == "DISKDRIVE" and not ("USBSTOR" in check_id or "USB" in check_id):
+            is_actionable = False
+
+        if not is_actionable:
+            tk.messagebox.showwarning("Action Denied", "Protection protocols prevent modifications to core internal system assets.")
+            return
+        
         device_name = target_dev.get("name", "")
         device_class = target_dev.get("type", "")
         raw_id = target_dev.get("raw_id") if target_dev.get("raw_id") and target_dev.get("raw_id") != "None" else device_name
 
-        # Local state fallback updating so UI toggles state locally instantly on press
+        # Mutate status changes safely
         target_dev["status"] = "BLOCKED" if process_type == "block" else "ACTIVE"
+        
+        # Repaint screen components layout immediately
         self.update_data_panes(self.active_remote_ip)
 
         if device_class.strip().lower() == "keyboard":
@@ -1008,4 +1484,5 @@ if __name__ == "__main__":
         root.tk = TkExtensionWrapper(root.tk)
     app = LANMonitorGUI(root)
     threading.Thread(target=start_agent_listener, args=(app.refresh_device_list,), daemon=True).start()
+    threading.Thread(target=active_device_sweeper, args=(app.refresh_device_list,), daemon=True).start()
     root.mainloop()
