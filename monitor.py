@@ -61,14 +61,13 @@ def start_agent_listener(update_callback):
                 try:
                     payload = json.loads(buffer.decode('utf-8', errors='ignore'))
                 except Exception:
-                    # Fallback dataset if the JSON parsing corrupts
                     payload = {}
 
                 if payload.get("action") == "agent_exit_chat":
                     if client_ip in network_database:
                         network_database[client_ip]["chat_status"] = "idle"
                     update_callback()
-                    continue # Skip regular telemetry compilation for this control packet
+                    continue 
 
                 # Fill default values defensively so UI rendering NEVER crashes
                 if "hostname" not in payload: payload["hostname"] = "WORKSTATION"
@@ -78,25 +77,22 @@ def start_agent_listener(update_callback):
                 if "history" not in payload: payload["history"] = []
                 if "devices" not in payload: payload["devices"] = []
                 
-                # --- CHAT STATE PERSISTENCE CORE ---
-                # Check if this endpoint has a historical state in our running database
+                # --- STATE FIX PERSISTENCE CORE ---
                 if client_ip in network_database and isinstance(network_database[client_ip], dict):
-                    # Extract its current chat state so it isn't erased
                     existing_chat = network_database[client_ip].get("chat_status", "idle")
                     payload["chat_status"] = existing_chat
+                    
+                    # Keep the exact status set by our manual refresh button
+                    payload["status"] = network_database[client_ip].get("status", "OFFLINE")
+                    payload["is_active"] = network_database[client_ip].get("is_active", False)
                 else:
-                    # Brand-new endpoint joining the grid; mark it idle
+                    # Brand new discovery entry registration
                     payload["chat_status"] = "idle"
+                    payload["status"] = "ACTIVE"
+                    payload["is_active"] = True
                 
-                # Enforce state rules for the Chat Selector window lookups
-                payload["status"] = "ACTIVE"
                 payload["last_seen"] = datetime.datetime.now()
-                payload["is_active"] = True
-                
-                # Commit cleanly to global state without losing chat history data
                 network_database[client_ip] = payload
-                
-                # Force Tkinter thread to repaint UI list instantly
                 update_callback()
         except Exception as e:
             print(f"[DEBUG ERROR] Listener thread anomaly: {e}")
@@ -133,9 +129,6 @@ class RemoteSessionWindow:
         self.dispatch_command_packet = dispatch_cmd_fn
         self.is_streaming = True
         self.stream_socket = None
-
-        # AUTOMATIC LOCKOUT EXECUTED ON TARGET NODE (Preserved Action)
-        self.dispatch_command_packet(self.target_ip, {"action": "lock_input"})
 
         # High-end CustomTkinter Toplevel window context allocation
         self.window = ctk.CTkToplevel(parent_root)
@@ -190,7 +183,18 @@ class RemoteSessionWindow:
         self.screen_canvas.bind("<ButtonRelease-1>", lambda e: self.send_mouse_click(e, "left", "up"))
         self.screen_canvas.bind("<ButtonPress-3>", lambda e: self.send_mouse_click(e, "right", "down"))
         self.screen_canvas.bind("<ButtonRelease-3>", lambda e: self.send_mouse_click(e, "right", "up"))
-        self.screen_canvas.bind("<Key>", self.send_key_event)
+        # --- BULLETPROOF KEYBOARD PROXY INTERFACE ---
+        # We create a focused entry proxy that forces native string capturing
+        self.keyboard_proxy = tk.Entry(self.window, width=0, bd=0, highlightthickness=0, bg="#0A0D14", fg="#0A0D14", insertbackground="#0A0D14")
+        self.keyboard_proxy.place(x=-100, y=-100, width=1, height=1) # Hide it completely off-screen layout boundaries
+        
+        # Capture raw text string dumps
+        self.keyboard_proxy.bind("<Key>", self.bulletproof_key_handler)
+        
+        # Force the entry to stay focused so typing works immediately
+        self.window.bind("<Button-1>", lambda e: self.keyboard_proxy.focus_set())
+        self.screen_canvas.bind("<Button-1>", lambda e: [self.handle_left_click_down(e), self.keyboard_proxy.focus_set()])
+        self.keyboard_proxy.focus_force()
 
         # Re-attach the exact Drag and Drop protocol hooks to Tkinter Canvas widget instance
         self.screen_canvas.drop_target_register(DND_FILES)
@@ -218,9 +222,31 @@ class RemoteSessionWindow:
         nx, ny = self.get_scaled_coordinates(event.x, event.y)
         self.dispatch_command_packet(self.target_ip, {"action": "mouse_click", "button": button, "state": button_state, "x": nx, "y": ny})
 
-    def send_key_event(self, event):
-        if event.keysym in ["Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R"]: return
-        self.dispatch_command_packet(self.target_ip, {"action": "key_input", "key": event.keysym})
+    def bulletproof_key_handler(self, event):
+        """Captures raw characters and explicit command execution macro mappings directly."""
+        char = event.char
+        keysym = event.keysym
+        
+        # Handle systemic functional hotkeys directly as clean instructions
+        functional_map = {
+            "Return": "enter", "BackSpace": "backspace", "Tab": "tab", "Escape": "escape",
+            "Delete": "delete", "space": "space", "Up": "up", "Down": "down", 
+            "Left": "left", "Right": "right"
+        }
+        
+        payload = {"action": "key_input", "mode": "direct"}
+        
+        if keysym in functional_map:
+            payload["type"] = "functional"
+            payload["value"] = functional_map[keysym]
+        elif char:
+            payload["type"] = "text"
+            payload["value"] = char
+        else:
+            return "break" # Drop modifier keys entirely to keep pipeline clear
+            
+        self.dispatch_command_packet(self.target_ip, payload)
+        return "break" # Prevents double-typing loops inside the hidden proxy widget
 
     def handle_file_drop_event(self, event):
         raw_filepath = event.data.strip()
@@ -241,14 +267,43 @@ class RemoteSessionWindow:
     def process_and_transmit_file(self, file_path):
         try:
             filename = os.path.basename(file_path)
-            with open(file_path, "rb") as target_file:
-                binary_payload = target_file.read()
-            b64_encoded_payload = base64.b64encode(binary_payload).decode('utf-8')
-            delivery_manifest = {"action": "drop_file", "file_name": filename, "file_data": b64_encoded_payload}
+            filesize = os.path.getsize(file_path)
             
-            self.dispatch_command_packet(self.target_ip, delivery_manifest)
+            # 1. Create a lightweight handshake manifest metadata descriptor
+            handshake_manifest = {
+                "action": "drop_file", 
+                "file_name": filename, 
+                "file_size": filesize
+            }
+            
+            # 2. Open a direct transmission pipe to the Agent's LISTEN_COMMAND_PORT (6006)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(10.0)
+                s.connect((self.target_ip, 6006))
+                
+                # Encode and dispatch the JSON handshake package size first
+                header_bytes = json.dumps(handshake_manifest).encode('utf-8')
+                s.sendall(len(header_bytes).to_bytes(4, byteorder='big'))
+                s.sendall(header_bytes)
+                
+                # Brief execution delay to let the Agent partition its system IO handles
+                time.sleep(0.15)
+                
+                # 3. Stream out file content segments sequentially via 64KB block fragments
+                with open(file_path, "rb") as target_file:
+                    while True:
+                        chunk = target_file.read(65536)
+                        if not chunk:
+                            break
+                        s.sendall(chunk)
+                        
+            print(f"[File Engine] Dispatched payload asset: {filename} ({filesize} bytes)")
+            
         except Exception as err:
-            self.parent_root.after(0, lambda: tk.messagebox.showerror("Canvas Engine Fault", f"Failed to transfer asset: {str(err)}"))
+            if hasattr(self, 'parent_root') and self.parent_root:
+                self.parent_root.after(0, lambda: tk.messagebox.showerror("Canvas Engine Fault", f"Failed to transfer asset: {str(err)}"))
+            elif hasattr(self, 'global_root_engine') and self.global_root_engine:
+                self.global_root_engine.after(0, lambda: tk.messagebox.showerror("Canvas Engine Fault", f"Failed to transfer asset: {str(err)}"))
 
     def pull_visual_stream_pipeline(self):
         """Thread worker that pulls raw screen streams from the agent engine."""
@@ -406,6 +461,20 @@ class LANMonitorGUI:
         )
         self.btn_chat_mgr.pack(side=tk.LEFT, expand=True, fill=ctk.X, padx=(0, 5))
 
+        # --- NEW FILE DEPLOYER BUTTON ---
+        self.btn_file_deployer = ctk.CTkButton(
+            button_container_frame,
+            text="📁 FILE DEPLOYER",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            fg_color="#3B82F6",       # High-visibility dashboard blue
+            hover_color="#2563EB",    # Deep blue hover
+            text_color="#FFFFFF",
+            height=36,
+            command=self.open_file_deployment_window
+        )
+        self.btn_file_deployer.pack(side=tk.LEFT, fill=ctk.X, padx=(5, 5))
+        # --------------------------------
+
         # 2. FIXED: Keeps your original variable name 'self.btn_broadcast' intact
         self.btn_broadcast = ctk.CTkButton(
             button_container_frame,
@@ -454,28 +523,51 @@ class LANMonitorGUI:
         # =====================================================================
         # 1. FAR LEFT COLUMN: MANAGE ENDPOINTS LIST
         # =====================================================================
-        self.endpoints_frame = ctk.CTkFrame(self.main_container, fg_color=self.c_card, width=320, corner_radius=16)
-        self.endpoints_frame.pack(side=ctk.LEFT, fill=ctk.Y)
-        self.endpoints_frame.pack_propagate(False)
+        self.endpoints_frame = ctk.CTkFrame(self.main_container, fg_color=self.c_card, corner_radius=16)
+        self.endpoints_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
 
         self.listbox_container = ctk.CTkFrame(self.endpoints_frame, fg_color=self.c_inner, corner_radius=12, border_width=1, border_color=self.c_border)
-        self.listbox_container.pack(fill=ctk.BOTH, expand=True, padx=15, pady=(20, 20))
+        self.listbox_container.pack(fill=ctk.BOTH, expand=True, padx=15, pady=20)
 
-        self.device_container = ctk.CTkScrollableFrame(
-            self.listbox_container,
-            fg_color="transparent",
-            label_text="MANAGED ENDPOINTS",
-            label_font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold")
+        # Custom Header Panel
+        self.header_panel = ctk.CTkFrame(self.listbox_container, fg_color="transparent")
+        self.header_panel.pack(fill=ctk.X, padx=15, pady=(15, 5))
+
+        self.title_lbl = ctk.CTkLabel(
+            self.header_panel, 
+            text="MANAGED ENDPOINTS", 
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold")
         )
-        self.device_container.pack(fill=ctk.BOTH, expand=True, padx=5, pady=5)
+        self.title_lbl.pack(side="left", anchor="w")
 
-        # Track the currently selected IP explicitly as a class variable string
+        self.refresh_btn = ctk.CTkButton(
+            self.header_panel,
+            text="🔄",
+            width=30,
+            height=30,
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            fg_color="#10B981",
+            hover_color="#059669",
+            corner_radius=6,
+            command=self.trigger_network_refresh
+        )
+        self.refresh_btn.pack(side="right", anchor="e")
+
+        self.device_container = ctk.CTkScrollableFrame(self.listbox_container, fg_color="transparent")
+        self.device_container.pack(fill=ctk.BOTH, expand=True, padx=5, pady=(0, 5))
+
         self.selected_device_ip = None
+        self.trigger_network_refresh()
         # =====================================================================
         # RIGHT HAND SIDE CONTAINER
         # =====================================================================
         self.right_workspace_stack = ctk.CTkFrame(self.main_container, fg_color=self.c_bg, corner_radius=0)
-        self.right_workspace_stack.pack(side=ctk.LEFT, fill=ctk.BOTH, expand=True, padx=(20, 0))
+        self.right_workspace_stack.grid(row=0, column=1, sticky="nsew", padx=(20, 0))
+
+# Make sure the parent window columns scale properly when resized:
+        self.main_container.grid_columnconfigure(0, weight=1) # Left side (endpoints list)
+        self.main_container.grid_columnconfigure(1, weight=3) # Right side (workspace) gets more room
+        self.main_container.grid_rowconfigure(0, weight=1)
 
         self.lbl_node_title = ctk.CTkLabel(
             self.right_workspace_stack, text="// ENDPOINT_MONITOR : STANDBY", 
@@ -495,6 +587,239 @@ class LANMonitorGUI:
         
         self.build_interactive_detail_panes()
 
+    def trigger_network_refresh(self):
+        """Asynchronously dispatches status requests to prevent UI lag."""
+        import threading
+        threading.Thread(target=self.broadcast_status_poll, daemon=True).start()
+
+
+    def broadcast_status_poll(self):
+        """
+        Dynamically discovers the local LAN subnet subnet, sweeps all host IPs, 
+        and adds discovered endpoints to the matrix state registry.
+        """
+        import socket
+        import json
+        import threading
+
+        # --- STEP 1: RESOLVE LOCAL SUBNET RANGE DYNAMICALLY ---
+        base_subnet = "192.168.1." # Default fallback
+        try:
+            # Open a temporary datagram socket to determine the active outbound interface IP
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                # Extract the subnet prefix (e.g., converts '192.168.1.45' into '192.168.1.')
+                base_subnet = ".".join(local_ip.split(".")[:3]) + "."
+        except Exception:
+            pass
+
+        # Generate a list of all potential host IPs on a typical /24 subnet (1 to 254)
+        scan_targets = [f"{base_subnet}{i}" for i in range(1, 255)]
+
+        payload = {"action": "poll_status"}
+        payload_bytes = json.dumps(payload).encode('utf-8')
+        payload_len = len(payload_bytes)
+
+        # Thread-safe result container
+        discovered_states = {}
+        lock = threading.Lock()
+
+        # --- STEP 2: HIGH-SPEED WORKER SUB-ROUTINE ---
+        def probe_target_ip(ip):
+            try:
+                # Target the administrative listening infrastructure port 6006 bound by agents
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.4)  # Aggressive timeout for blazing fast LAN sweeps
+                    s.connect((ip, 6006))
+                    
+                    # Direct binary payload length packet framing transmission
+                    s.sendall(payload_len.to_bytes(4, byteorder='big'))
+                    s.sendall(payload_bytes)
+                    
+                    # If connection passes, store verified online data structures
+                    with lock:
+                        discovered_states[ip] = {
+                            "status": "ACTIVE",
+                            "is_active": True,
+                            "hostname": f"NODE-{ip.split('.')[-1]}", # Temporary fallback name
+                            "os": "Windows 10/11",
+                            "chat_status": "idle"
+                        }
+            except (socket.timeout, ConnectionRefusedError, OSError):
+                # If a device was previously found but is now dark, flag it offline safely
+                if 'network_database' in globals() and ip in network_database:
+                    with lock:
+                        discovered_states[ip] = network_database[ip].copy()
+                        discovered_states[ip]["status"] = "OFFLINE"
+                        discovered_states[ip]["is_active"] = False
+
+        # Dispatch probe workers across multiple parallel threads to avoid lag
+        threads = []
+        for target_ip in scan_targets:
+            t = threading.Thread(target=probe_target_ip, args=(target_ip,))
+            t.daemon = True
+            threads.append(t)
+            t.start()
+
+        # Wait for all network probe operations to return
+        for t in threads:
+            t.join()
+
+        # --- STEP 3: MERGE DISCOVERIES WITH MEMORY STATE MAP ---
+        if 'network_database' not in globals():
+            globals()['network_database'] = {}
+
+        for ip, fresh_data in discovered_states.items():
+            if ip in network_database:
+                # Merge fields selectively so you don't overwrite chat states or telemetry arrays
+                network_database[ip]["status"] = fresh_data["status"]
+                network_database[ip]["is_active"] = fresh_data["is_active"]
+            else:
+                # Register entirely brand new machine found on the LAN wire
+                network_database[ip] = fresh_data
+
+        # Re-sync with main thread to rebuild the user interface views safely
+        if hasattr(self, 'refresh_device_list'):
+            self.root.after(0, self.refresh_device_list)
+        elif hasattr(self, 'update_data_panes'):
+            self.root.after(0, lambda: self.update_data_panes(self.selected_device_ip))
+
+    def open_file_deployment_window(self):
+        """Spawns a styled deployment controller panel matching the design system."""
+        deploy_win = ctk.CTkToplevel(self.root)
+        deploy_win.title("NEXUS // FILE DEPLOYMENT SUB-SYSTEM")
+        deploy_win.geometry("580x420")
+        deploy_win.configure(fg_color=self.c_bg)
+        deploy_win.attributes("-topmost", True)
+        deploy_win.resizable(False, False)
+
+        # Main wrapper padding layout card
+        wrapper = ctk.CTkFrame(deploy_win, fg_color=self.c_card, corner_radius=12, border_width=1, border_color=self.c_border)
+        wrapper.pack(fill=ctk.BOTH, expand=True, padx=20, pady=20)
+
+        # Title Label
+        ctk.CTkLabel(
+            wrapper, text="REMOTE FILE DISTRIBUTION ENGINE", 
+            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"), text_color=self.c_accent
+        ).pack(anchor="w", padx=20, pady=(20, 15))
+
+        # --- SECTION 1: SOURCE FILE SELECTOR ---
+        ctk.CTkLabel(wrapper, text="Select Source File:", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color=self.c_text_muted).pack(anchor="w", padx=20)
+        
+        file_selection_frame = ctk.CTkFrame(wrapper, fg_color="transparent")
+        file_selection_frame.pack(fill=ctk.X, padx=20, pady=(4, 15))
+
+        selected_file_path = tk.StringVar(value="No file selected...")
+        
+        file_entry = ctk.CTkEntry(file_selection_frame, textvariable=selected_file_path, font=ctk.CTkFont(family="Segoe UI", size=11), fg_color=self.c_inner, border_color=self.c_border, text_color=self.c_text_main, state="readonly")
+        file_entry.pack(side=tk.LEFT, fill=ctk.X, expand=True, padx=(0, 8))
+
+        def browse_local_file():
+            from tkinter import filedialog
+            chosen = filedialog.askopenfilename()
+            if chosen:
+                selected_file_path.set(chosen)
+
+        browse_btn = ctk.CTkButton(file_selection_frame, text="Browse...", width=90, fg_color=self.c_inner, border_width=1, border_color=self.c_border, hover_color="#243147", command=browse_local_file)
+        browse_btn.pack(side=tk.RIGHT)
+
+        # --- SECTION 2: DESTINATION PATH CONFIGURATOR ---
+        ctk.CTkLabel(wrapper, text="Target Deployment Destination Path:", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color=self.c_text_muted).pack(anchor="w", padx=20)
+        
+        dest_path_entry = ctk.CTkEntry(
+            wrapper, 
+            font=ctk.CTkFont(family="Segoe UI", size=11), 
+            fg_color=self.c_inner, 
+            border_color=self.c_border, 
+            text_color=self.c_accent,
+            placeholder_text=r"C:\Program Files\Agent_track"
+        )
+        dest_path_entry.pack(fill=ctk.X, padx=20, pady=(4, 25))
+        dest_path_entry.insert(0, r"C:\Program Files\Agent_track") 
+
+        # --- SECTION 3: DEPLOYMENT EXECUTION CONTROL ---
+        status_lbl = ctk.CTkLabel(wrapper, text="Status: Standby.", font=ctk.CTkFont(family="Segoe UI", size=11, slant="italic"), text_color=self.c_text_muted)
+        status_lbl.pack(anchor="w", padx=20, pady=(0, 10))
+
+        def trigger_mass_distribution():
+            src = selected_file_path.get()
+            dest = dest_path_entry.get().strip()
+            
+            import os
+            if not src or src == "No file selected..." or not os.path.exists(src):
+                status_lbl.configure(text="Status Error: Please specify a valid local source file.", text_color=self.c_alert)
+                return
+            if not dest:
+                status_lbl.configure(text="Status Error: Deployment path cannot be empty.", text_color=self.c_alert)
+                return
+
+            status_lbl.configure(text="Status: Distributing packets...", text_color=self.c_accent)
+            
+            import threading
+            threading.Thread(target=execute_network_file_push, args=(src, dest, status_lbl), daemon=True).start()
+
+        def execute_network_file_push(local_file, remote_target_dir, feedback_ui_lbl):
+            import socket
+            import json
+            import os
+
+            filename = os.path.basename(local_file)
+            file_size = os.path.getsize(local_file)
+
+            active_targets = []
+            if 'network_database' in globals():
+                for ip, data in network_database.items():
+                    if data.get("status") == "ACTIVE" or data.get("is_active") is True:
+                        active_targets.append(ip)
+
+            if not active_targets:
+                deploy_win.after(0, lambda: feedback_ui_lbl.configure(text="Status: Cancelled. No active endpoint machines detected.", text_color=self.c_alert))
+                return
+
+            success_counter = 0
+            
+            # Formulate clear instructions payload
+            directive = {
+                "action": "drop_file",
+                "file_name": filename,
+                "file_size": file_size,
+                "target_directory": remote_target_dir
+            }
+            directive_bytes = json.dumps(directive).encode('utf-8')
+            directive_len = len(directive_bytes)
+
+            for target_ip in active_targets:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(6.0) # Expanded timeout threshold for massive binary uploads
+                        s.connect((target_ip, 6006))
+                        
+                        s.sendall(directive_len.to_bytes(4, byteorder='big'))
+                        s.sendall(directive_bytes)
+                        
+                        with open(local_file, "rb") as f:
+                            while True:
+                                chunk = f.read(65536)
+                                if not chunk:
+                                    break
+                                s.sendall(chunk)
+                        success_counter += 1
+                except Exception as e:
+                    print(f"[DEPLOYMENT PIPELINE EXCEPTION] Node connection failure ({target_ip}): {e}")
+
+            final_msg = f"Status: Completed. Uploaded successfully to [{success_counter}/{len(active_targets)}] endpoints."
+            txt_color = "#10B981" if success_counter > 0 else self.c_alert
+            deploy_win.after(0, lambda: feedback_ui_lbl.configure(text=final_msg, text_color=txt_color))
+
+        action_btn = ctk.CTkButton(
+            wrapper, text="🚀 UPDATE AGENT FILES", 
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            fg_color="#3B82F6", hover_color="#2563EB", height=40,
+            command=trigger_mass_distribution
+        )
+        action_btn.pack(fill=ctk.X, padx=20, pady=(10, 10))
+        
     def get_device_signature(self, device_dict):
         """
         Generates a normalized, unique lookup key for a hardware device
@@ -587,7 +912,6 @@ class LANMonitorGUI:
 
     def build_interactive_detail_panes(self):
         # -----------------------------------------------------------------
-        # -----------------------------------------------------------------
         # PANE 1: BROWSING HISTORY LOG GRID
         # -----------------------------------------------------------------
 
@@ -619,11 +943,9 @@ class LANMonitorGUI:
 
         self.history_table.pack(side=tk.LEFT,fill=tk.BOTH,expand=True,padx=(8, 0),pady=8)
         # --------------------------------------------------------
-
         # Note: Your original raw text widget string parser line (self.tree) 
         # can remain or be removed depending on whether you're transitioning 
         # fully over to the Treeview widget system!
-
         # -----------------------------------------------------------------
         # PANE 2: CONNECTED HARDWARE SUBSYSTEM LIST (With Sticky Top Headers)
         # -----------------------------------------------------------------
@@ -655,13 +977,12 @@ class LANMonitorGUI:
             height=34, corner_radius=17, command=lambda: self.execute_smart_hardware_action("block")
         )
         self.btn_smart_block.pack(side=tk.RIGHT, padx=5)
-
+        
         # Live Scrollable Container for Interactive Selection Rows
         self.hw_scroll_container = ctk.CTkScrollableFrame(
             inner_hw, fg_color=self.c_inner, corner_radius=12, border_width=1, border_color=self.c_border
         )
         self.hw_scroll_container.pack(fill=ctk.BOTH, expand=True)
-
         # -----------------------------------------------------------------
         # PANE 3: REMOTE DESKTOP LIVE STREAM SHELL
         # -----------------------------------------------------------------
@@ -679,7 +1000,6 @@ class LANMonitorGUI:
             height=44, corner_radius=22, command=self.open_remote_session
         )
         self.btn_launch_gui.pack(anchor="w")
-
         # -----------------------------------------------------------------
         # PANE 4: DIRECTIVE NOTIFICATION ALERT TRANSMITTER ENGINE
         # -----------------------------------------------------------------
@@ -777,7 +1097,7 @@ class LANMonitorGUI:
             placeholder = ctk.CTkLabel(
                 self.device_container, 
                 text="Waiting for corporate agent check-ins...", 
-                font=ctk.CTkFont(family="Segoe UI", size=12, italic=True),
+                font=ctk.CTkFont(family="Segoe UI", size=12, slant="italic"),
                 text_color=self.c_text_muted if hasattr(self, 'c_text_muted') else "#888888"
             )
             placeholder.pack(pady=20)
@@ -1008,7 +1328,7 @@ class LANMonitorGUI:
 
                 if not hasattr(self, 'selected_device_id_key'):
                     self.selected_device_id_key = None
-
+                
                 def handle_hardware_click(event, target_device):
                     # FIX: Uses the unified signature engine method so event assignments match perfectly
                     self.selected_device_id_key = self.get_device_signature(target_device)
@@ -1088,6 +1408,64 @@ class LANMonitorGUI:
             self.root.update_idletasks()
             if hasattr(self.hw_scroll_container, "_update_scrollbar"):
                 self.hw_scroll_container._update_scrollbar()
+        # =====================================================================
+        # --- MASTER USB SECURITY BAR GENERATION ---
+        # =====================================================================
+        
+        # 1. Clean up old references to prevent layout compounding or widget overlapping
+        if hasattr(self, 'usb_control_frame') and self.usb_control_frame:
+            try:
+                self.usb_control_frame.destroy()
+            except Exception:
+                pass
+
+        # 2. Re-instantiate the panel container inside the hardware frame context
+        self.usb_control_frame = ctk.CTkFrame(self.hardware_frame, fg_color=self.c_card, height=60)
+        # Force it to anchor cleanly at the very bottom of the view panel
+        self.usb_control_frame.pack(fill=ctk.X, padx=25, pady=(15, 20), side=tk.BOTTOM)
+        self.usb_control_frame.pack_propagate(False) # Keep fixed height alignment sleek
+
+        # 3. Pull status data from the database state engine (FIXED to use 'ip')
+        active_data = network_database.get(ip, {}) if ip else {}
+        current_usb_stat = active_data.get("usb_status", "ACTIVE") 
+
+        # 4. Map conditions based on agent status responses
+        if current_usb_stat == "BLOCKED":
+            status_text = "BLOCKED"
+            status_color = "#EF4444"      # Crimson Red
+            btn_text = "ENABLE ALL USB PORTS"
+            btn_color = "#10B981"      # Emerald Green
+            btn_hover = "#059669"
+            target_action = "unblock"
+        else:
+            status_text = "ACTIVE"
+            status_color = "#10B981"      # Emerald Green (or fall back to self.c_accent)
+            btn_text = "BLOCK ALL USB PORTS"
+            btn_color = "#EF4444"      # Crimson Red
+            btn_hover = "#DC2626"
+            target_action = "block"
+
+        # 5. Populate and render UI Matrix Components
+        lbl_usb_title = ctk.CTkLabel(
+            self.usb_control_frame, 
+            text=f"// USB PORTS SECURITY MATRIX: [{status_text}]", 
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+            text_color=status_color
+        )
+        lbl_usb_title.pack(side=tk.LEFT, padx=20, expand=False)
+
+        btn_master_usb = ctk.CTkButton(
+            self.usb_control_frame,
+            text=btn_text,
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            fg_color=btn_color,
+            hover_color=btn_hover,
+            text_color="#FFFFFF",
+            width=190,
+            height=34,
+            command=lambda: self.execute_master_usb_action(target_action)
+        )
+        btn_master_usb.pack(side=tk.RIGHT, padx=20)
 
     def _render_canvas_frame(self, pil_image):
         """Executes safely on the main Tkinter thread context via .after()"""
@@ -1462,6 +1840,31 @@ class LANMonitorGUI:
             action_directive = "block_device" if process_type == "block" else "unblock_device"
             self.dispatch_command_packet(self.active_remote_ip, {"action": action_directive, "device_type": device_class, "device_name": device_name, "raw_id": raw_id})
 
+    def execute_master_usb_action(self, process_type):
+        """Sends a global command to the agent to block or unblock all USB storage."""
+        if not hasattr(self, 'active_remote_ip') or not self.active_remote_ip: 
+            tk.messagebox.showwarning("Selection Required", "Please select an active computer endpoint target from the connection list first.")
+            return
+            
+        confirm = tk.messagebox.askyesno(
+            "Security Escalation", 
+            f"Are you sure you want to {process_type.upper()} ALL USB storage devices on target PC [{self.active_remote_ip}]?"
+        )
+        if not confirm: 
+            return
+
+        action_directive = "block_all_usb" if process_type == "block" else "unblock_all_usb"
+        
+        # Optimistically set the local UI database state so it feels responsive
+        if self.active_remote_ip in network_database:
+            network_database[self.active_remote_ip]["usb_status"] = "BLOCKED" if process_type == "block" else "ACTIVE"
+        
+        # Construct and dispatch payload block via your thread background system
+        payload = {"action": action_directive}
+        self.dispatch_command_packet(self.active_remote_ip, payload)
+        
+        # Refresh the display immediately to reflect changes
+        self.update_data_panes(self.active_remote_ip)
 
 if __name__ == "__main__":
     root = TkinterDnD.Tk()
@@ -1484,5 +1887,5 @@ if __name__ == "__main__":
         root.tk = TkExtensionWrapper(root.tk)
     app = LANMonitorGUI(root)
     threading.Thread(target=start_agent_listener, args=(app.refresh_device_list,), daemon=True).start()
-    threading.Thread(target=active_device_sweeper, args=(app.refresh_device_list,), daemon=True).start()
+    #threading.Thread(target=active_device_sweeper, args=(app.refresh_device_list,), daemon=True).start()
     root.mainloop()
