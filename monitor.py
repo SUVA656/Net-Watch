@@ -1,8 +1,10 @@
 import socket
 import threading
 import json
+import glob
 import io
 import os
+import sys
 import base64
 import tkinter as tk
 from tkinter import ttk
@@ -33,20 +35,20 @@ GLOBAL_DAILY_ARCHIVE_REGISTRY = {
     "processed_ips": set()
 }
 
-# Strict preservation of original length-prefixed socket background processing listener
+# Strict preservation of original length-prefixed socket background processing listenerdef start_agent_listener(update_callback):
 def start_agent_listener(update_callback):
     """
     Listens for TCP telemetry data on port 5005.
     Guarantees device registration by handling empty or partial payloads safely,
-    while preserving active states such as global chat room allocations.
+    while preserving active states such as global chat room allocations and web_logs accumulation.
+    Optimized for production use with all console debugging prints removed.
     """
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         server.bind(('0.0.0.0', 5005))
         server.listen(50)
-    except Exception as e:
-        print(f"[CRITICAL] Failed to bind telemetry port 5005: {e}")
+    except Exception:
         return
 
     while True:
@@ -54,14 +56,12 @@ def start_agent_listener(update_callback):
             sock, addr = server.accept()
             client_ip = str(addr[0])
             
-            # Read 4-byte payload length header
             len_bytes = sock.recv(4)
             if not len_bytes:
                 sock.close()
                 continue
             payload_len = int.from_bytes(len_bytes, byteorder='big')
             
-            # Stream the complete JSON array string
             buffer = b""
             while len(buffer) < payload_len:
                 chunk = sock.recv(min(payload_len - len(buffer), 4096))
@@ -82,9 +82,7 @@ def start_agent_listener(update_callback):
                     update_callback()
                     continue 
 
-                # =====================================================================
-                # NEW: VIDEO CALL STATUS UPDATE INTERCEPTOR
-                # =====================================================================
+                # --- VIDEO CALL STATUS UPDATE INTERCEPTOR ---
                 if payload.get("type") == "status_update":
                     if client_ip in network_database:
                         if payload.get("status") == "idle":
@@ -95,88 +93,117 @@ def start_agent_listener(update_callback):
                             network_database[client_ip]["vc_peers"] = payload.get("peers", [])
                     update_callback()
                     continue
-                # =====================================================================
 
-                # Fill default values defensively so UI rendering NEVER crashes
+                # Defensive initialization for core data blocks
                 if "hostname" not in payload: payload["hostname"] = "WORKSTATION"
                 if "os" not in payload: payload["os"] = "Windows 10/11"
                 if "ram" not in payload: payload["ram"] = "Unknown RAM"
                 if "cpu" not in payload: payload["cpu"] = "Unknown CPU"
-                if "history" not in payload: payload["history"] = []
                 if "devices" not in payload: payload["devices"] = []
+                
+                # --- PROCESS DATA CAPTURE AND CACHING ---
+                incoming_history = payload.get("web_logs", payload.get("history", []))
+                
+                existing_history_cache = []
+                if client_ip in network_database:
+                    existing_history_cache = network_database[client_ip].get("web_logs", network_database[client_ip].get("history", []))
+                
+                if not isinstance(existing_history_cache, list):
+                    existing_history_cache = []
+
+                backup_timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+
+                for log_item in incoming_history:
+                    if isinstance(log_item, dict):
+                        url_str = str(log_item.get("url", log_item.get("site", ""))).strip()
+                        time_str = str(log_item.get("time", log_item.get("ip", log_item.get("timestamp", backup_timestamp)))).strip()
+                        
+                        if not url_str:
+                            continue
+
+                        # Dual key dictionary injection maps seamlessly to legacy/modern UI requirements
+                        normalized_log = {
+                            "url": url_str, 
+                            "time": time_str,
+                            "site": url_str,   
+                            "ip": time_str     
+                        }
+                        
+                        if normalized_log not in existing_history_cache:
+                            existing_history_cache.append(normalized_log)
+
+                payload["web_logs"] = existing_history_cache
+                payload["history"] = existing_history_cache
+
+                # Execute storage mechanics
                 process_agent_daily_archive(client_ip, payload)
-                # --- STATE FIX PERSISTENCE CORE ---
+                
+                # --- PERSIST CORRELATION STATES ---
                 if client_ip in network_database and isinstance(network_database[client_ip], dict):
-                    existing_chat = network_database[client_ip].get("chat_status", "idle")
-                    payload["chat_status"] = existing_chat
-                    
-                    # 📹 PRESERVE LIVE VIDEO CALL STATE ACROSS NORMAL TELEMETRY HEARTBEATS
+                    payload["chat_status"] = network_database[client_ip].get("chat_status", "idle")
                     payload["vc_status"] = network_database[client_ip].get("vc_status", "idle")
                     payload["vc_peers"] = network_database[client_ip].get("vc_peers", [])
-                    
-                    # Keep the exact status set by our manual refresh button
                     payload["status"] = network_database[client_ip].get("status", "OFFLINE")
                     payload["is_active"] = network_database[client_ip].get("is_active", False)
                 else:
-                    # Brand new discovery entry registration
                     payload["chat_status"] = "idle"
                     payload["vc_status"] = "idle"
                     payload["vc_peers"] = []
                     payload["status"] = "ACTIVE"
                     payload["is_active"] = True
                 
-                payload["last_seen"] = datetime.now()
+                try:
+                    payload["last_seen"] = datetime.now()
+                except Exception:
+                    payload["last_seen"] = backup_timestamp
+
                 network_database[client_ip] = payload
+                
+                # Dynamic UI synchronization trigger
                 update_callback()
-        except Exception as e:
-            print(f"[DEBUG ERROR] Listener thread anomaly: {e}")
+                
+                if hasattr(update_callback, '__self__'):
+                    gui_instance = update_callback.__self__
+                    if hasattr(gui_instance, 'compile_startup_device_list'):
+                        gui_instance.compile_startup_device_list()
+
+        except Exception:
+            pass
 
 def process_agent_daily_archive(agent_ip, payload_dict):
     """
-    Archives yesterday's browser history and current device specs 
-    into a nested JSON folder hierarchy under data_store/.
+    Saves current device hardware snapshots inside data_store/Device/<ip>/.
+    Strictly discards browser history records and drops hardware state files 
+    that are older than a rolling 7-day sequence window (today & past 6 days).
     """
     try:
-        # FIXED: Cleaned up the direct class calls
         today_str = datetime.now().strftime("%Y-%m-%d")
-        yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
         
         # Reset tracking registry if calendar shifts while dashboard is running
         if GLOBAL_DAILY_ARCHIVE_REGISTRY["current_date"] != today_str:
             GLOBAL_DAILY_ARCHIVE_REGISTRY["current_date"] = today_str
             GLOBAL_DAILY_ARCHIVE_REGISTRY["processed_ips"].clear()
 
+        # Dynamically build directory targets (Now includes the agent IP as a folder)
+        device_dir = os.path.join(DATA_STORE_DIR, "Device", agent_ip)
+        history_dir = os.path.join(DATA_STORE_DIR, "History")
+        
+        os.makedirs(device_dir, exist_ok=True)
+
+        # --- STEP 1: IMMEDIATELY DROP/PREVENT HISTORY STORAGE ---
+        if os.path.exists(history_dir):
+            import shutil
+            try:
+                shutil.rmtree(history_dir)
+            except Exception:
+                pass
+
         # Exit if this agent has checked in and saved data already today
         if agent_ip in GLOBAL_DAILY_ARCHIVE_REGISTRY["processed_ips"]:
             return
-
-        # Dynamically build specific directory targets
-        history_dir = os.path.join(DATA_STORE_DIR, "History", agent_ip)
-        device_dir = os.path.join(DATA_STORE_DIR, "Device", agent_ip)
-        
-        os.makedirs(history_dir, exist_ok=True)
-        os.makedirs(device_dir, exist_ok=True)
-        
-        # 1. Filter out browser history belonging to yesterday
-        raw_history = payload_dict.get("history", [])
-        filtered_history = []
-        
-        for entry in raw_history:
-            visit_time = entry.get("ip", "")  # Extract timestamp key converted by Agent
-            if visit_time.startswith(yesterday_str):
-                filtered_history.append({
-                    "url": entry.get("site"),
-                    "visit_time": visit_time
-                })
-        
-        # Write history file: data_store/History/<ip>/<yesterday_date>.json
-        history_file_path = os.path.join(history_dir, f"{yesterday_str}.json")
-        with open(history_file_path, "w", encoding="utf-8") as f:
-            json.dump(filtered_history, f, indent=4, ensure_ascii=False)
             
-        # 2. Package current connection specifications
+        # --- STEP 2: PACKAGE AND SAVE CURRENT HARDWARE CONFIG ---
         device_payload = {
-            # FIXED: Direct class use here as well
             "archive_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "system_specs": {
                 "hostname": payload_dict.get("hostname"),
@@ -189,42 +216,35 @@ def process_agent_daily_archive(agent_ip, payload_dict):
             "usb_status": payload_dict.get("usb_status")
         }
         
-        # Write device specifications: data_store/Device/<ip>/<current_date>.json
-        device_file_path = os.path.join(device_dir, f"{today_str}.json")
+        # Save nested: data_store/Device/<ip>/hardware_<date>.json
+        device_file_path = os.path.join(device_dir, f"hardware_{today_str}.json")
         with open(device_file_path, "w", encoding="utf-8") as f:
             json.dump(device_payload, f, indent=4, ensure_ascii=False)
             
         # Prevent secondary writes for this client for the remainder of the day
         GLOBAL_DAILY_ARCHIVE_REGISTRY["processed_ips"].add(agent_ip)
-        print(f"[+] Secure structural backup synchronized for agent: {agent_ip}")
+        print(f"[+] Hardware backup synchronized for agent: {agent_ip}")
         
+        # --- STEP 3: ENFORCE ROLLING 7-DAY HARDWARE RETENTION POLICY ---
+        # Generate an array containing allowed filenames for today and the last 6 days
+        allowed_filenames = [
+            f"hardware_{(datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')}.json"
+            for i in range(7)
+        ]
+        
+        # Scan inside this specific agent's folder for expired logs
+        for file_path in glob.glob(os.path.join(device_dir, "*.json")):
+            filename = os.path.basename(file_path)
+            
+            if filename not in allowed_filenames:
+                try:
+                    os.remove(file_path)
+                    print(f"[*] Purged expired historical hardware snapshot: {agent_ip}/{filename}")
+                except Exception:
+                    pass
+                    
     except Exception as e:
-        print(f"[-] Failed to execute daily file integration pass for {agent_ip}: {e}")
-
-def active_device_sweeper(update_callback):
-    """
-    Scans network data states every 2 seconds. Switches flag states 
-    to False if an agent drops offline, triggering a safe UI list update.
-    """
-    while True:
-        time.sleep(2)
-        now = datetime.datetime.now()
-        state_changed = False
-        
-        # Cast to list to avoid runtime dictionary sizing errors
-        for client_ip, dataset in list(network_database.items()):
-            last_timestamp = dataset.get("last_seen")
-            if last_timestamp:
-                elapsed = (now - last_timestamp).total_seconds()
-                # If an agent misses connections for over 15 seconds, flag it offline
-                if elapsed > 15:
-                    if dataset.get("is_active", True) is True:
-                        dataset["is_active"] = False
-                        state_changed = True
-                        
-        if state_changed:
-            update_callback()
-
+        print(f"[-] Failed to execute daily archive filtering pass for {agent_ip}: {e}")
 
 class RemoteSessionWindow:
     def __init__(self, parent_root, target_ip, dispatch_cmd_fn):
@@ -540,6 +560,9 @@ class LANMonitorGUI:
         self.selected_hardware_index = None
         self.hardware_row_widgets = []
 
+        # Place this inside your LANMonitorGUI.__init__ constructor setup
+        self.threat_whitelist = ["ayudh.net", "google.com", "github.com"]
+
         # Apply custom theme configurations
         ctk.set_appearance_mode("dark")
         self.root.configure(bg=self.c_bg)
@@ -555,20 +578,48 @@ class LANMonitorGUI:
         # =====================================================================
         # PLACE THIS REGISTRATION BLOCK OUTSIDE EXPLICITLY INSIDE YOUR MAIN UI GENERATOR
         # =====================================================================
-        # Make sure 'button_container_frame' exists where you construct your control panels:
+        # --- NAVIGATION / UTILITY PANEL BUTTON GENERATION MATRIX ---
+
+        self.btn_view_logs = ctk.CTkButton(
+            button_container_frame,
+            text="📂VIEW LOGS",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            fg_color="#4B5563",       # Charcoal Gray for utility system look
+            hover_color="#374151",    
+            text_color="#FFFFFF",
+            width=110,
+            height=34,
+            command=self.open_list_folder
+        )
+        self.btn_view_logs.pack(side=tk.LEFT, fill=ctk.X, padx=(0, 5))
+
+        btn_hw_change = ctk.CTkButton(
+            button_container_frame, 
+            text="HARDWARE CHANGE",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            fg_color=self.c_accent, 
+            hover_color="#2563EB",
+            text_color="#000000",
+            width=140,
+            height=34,
+            command=self.open_hardware_change_window
+        )
+        btn_hw_change.pack(side=tk.LEFT, fill=ctk.X, padx=(0, 5))
+
+        # 2. VIDEO MATRIX BUTTON
         self.btn_video_call = ctk.CTkButton(
             button_container_frame,
-            text="📹 VIDEO MATRIX",
+            text="📹VIDEO MATRIX",
             font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
             fg_color=self.c_accent,       
             hover_color="#00C8D4",       
             text_color="#0A0D14",        
             height=36,
-            command=self.open_video_call_manager  # <--- Points to the fixed method directly via class reference
+            command=self.open_video_call_manager  
         )
-        self.btn_video_call.pack(side=tk.LEFT, fill=ctk.X, padx=(0, 5))
+        self.btn_video_call.pack(side=tk.LEFT, fill=ctk.X, padx=(5, 5))
 
-        # 1. New Chat Manager Button placed on the left side
+        # 3. CHAT MANAGER BUTTON
         self.btn_chat_mgr = ctk.CTkButton(
             button_container_frame,
             text="🗨️CHAT MANAGER",
@@ -579,26 +630,37 @@ class LANMonitorGUI:
             height=36,
             command=self.open_chat_management_window
         )
-        self.btn_chat_mgr.pack(side=tk.LEFT, expand=True, fill=ctk.X, padx=(0, 5))
+        self.btn_chat_mgr.pack(side=tk.LEFT, fill=ctk.X, padx=(5, 5))
 
-        # --- NEW FILE DEPLOYER BUTTON ---
+        # 4. FILE DEPLOYER BUTTON
         self.btn_file_deployer = ctk.CTkButton(
             button_container_frame,
             text="📁 FILE DEPLOYER",
             font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-            fg_color="#3B82F6",       # High-visibility dashboard blue
-            hover_color="#2563EB",    # Deep blue hover
+            fg_color="#3B82F6",       
+            hover_color="#2563EB",    
             text_color="#FFFFFF",
             height=36,
             command=self.open_file_deployment_window
         )
         self.btn_file_deployer.pack(side=tk.LEFT, fill=ctk.X, padx=(5, 5))
-        # --------------------------------
 
-        # 2. FIXED: Keeps your original variable name 'self.btn_broadcast' intact
+        self.btn_threat_matrix = ctk.CTkButton(
+            button_container_frame,
+            text="🚨 THREAT MATRIX",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            fg_color="#D97706",       # Amber Warning Orange
+            hover_color="#B45309",    
+            text_color="#FFFFFF",
+            height=36,
+            command=self.open_threat_matrix_window
+        )
+        self.btn_threat_matrix.pack(side=tk.LEFT, fill=ctk.X, padx=(5, 5))
+
+        # 5. BROADCAST SYSTEM ALERT BUTTON (Last on the right)
         self.btn_broadcast = ctk.CTkButton(
             button_container_frame,
-            text="⚠️ BROADCAST SYSTEM ALERT",
+            text="⚠️BROADCAST SYSTEM",
             font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
             fg_color="#EF4444",
             hover_color="#DC2626",
@@ -606,10 +668,9 @@ class LANMonitorGUI:
             height=36,
             command=self.open_broadcast_window
         )
-        self.btn_broadcast.pack(side=tk.LEFT, expand=True, fill=ctk.X, padx=(5, 0))
+        self.btn_broadcast.pack(side=tk.LEFT, fill=ctk.X, padx=(5, 0))
 
-        # Instead of packing the individual buttons directly to self.root, 
-        # we place the entire container exactly where your old broadcast button went!
+        # Render the toolbar cluster container frame
         button_container_frame.place(relx=1.0, rely=0.02, anchor="ne", x=-20)
 
         # --- HIGH-END SYSTEM-MATCHED TREEVIEW DESIGN SPECIFICATION ---
@@ -707,6 +768,387 @@ class LANMonitorGUI:
         self.workspace_detail_view.pack(fill=ctk.BOTH, expand=True)
         
         self.build_interactive_detail_panes()
+
+    def open_threat_matrix_window(self):
+        """Spawns the Threat Matrix window with a dynamic automatic live-refresh polling mechanism."""
+        from tkinter import ttk
+
+        threat_win = ctk.CTkToplevel(self.root)
+        threat_win.title("Endpoint Threat Audit Logs")
+        threat_win.geometry("850x500")
+        
+        # Prevent parent layer execution interactions while open
+        threat_win.grab_set()  
+
+        # --- Top Action Frame (Whitelist Add Tool) ---
+        top_frame = ctk.CTkFrame(threat_win, height=60, fg_color="transparent")
+        top_frame.pack(fill=ctk.X, padx=15, pady=10)
+
+        lbl_whitelist = ctk.CTkLabel(top_frame, text="Whitelist Domain:", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"))
+        lbl_whitelist.pack(side=tk.LEFT, padx=(0, 10))
+
+        entry_domain = ctk.CTkEntry(top_frame, placeholder_text="e.g. platform.com", width=200)
+        entry_domain.pack(side=tk.LEFT, padx=(0, 10))
+
+        def add_to_whitelist():
+            dom = entry_domain.get().strip().lower()
+            if dom:
+                if dom not in self.threat_whitelist:
+                    self.threat_whitelist.append(dom)
+                    tk.messagebox.showinfo("Success", f"'{dom}' added to whitelist.")
+                    entry_domain.delete(0, tk.END)
+                    refresh_table_data() 
+                else:
+                    tk.messagebox.showwarning("Notice", "Domain already whitelisted.")
+
+        btn_add_wl = ctk.CTkButton(top_frame, text="Add Domain", fg_color="#10B981", hover_color="#059669", width=100, command=add_to_whitelist)
+        btn_add_wl.pack(side=tk.LEFT)
+
+        # --- Main Table Grid Frame ---
+        table_frame = ctk.CTkFrame(threat_win)
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 15))
+
+        columns = ("ip", "threat", "url", "timestamp")
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Treeview", background="#1E293B", foreground="#F8FAFC", fieldbackground="#1E293B", rowheight=26, font=("Segoe UI", 10))
+        style.configure("Treeview.Heading", background="#334155", foreground="#FFFFFF", font=("Segoe UI", 11, "bold"))
+        
+        # FIX: Explicit style maps ensure CustomTkinter doesn't override item text highlighting
+        style.map("Treeview", background=[('selected', '#3B82F6')], foreground=[('selected', '#FFFFFF')])
+
+        tree = ttk.Treeview(table_frame, columns=columns, show="headings")
+        tree.heading("ip", text="Endpoint Source IP")
+        tree.heading("threat", text="Threat Status")
+        tree.heading("url", text="Target Destination URL")
+        tree.heading("timestamp", text="Access Timestamp")
+
+        tree.column("ip", width=140, anchor="center")
+        tree.column("threat", width=120, anchor="center")
+        tree.column("url", width=380, anchor="w")
+        tree.column("timestamp", width=160, anchor="center")
+
+        scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Configure row color alerting tags
+        tree.tag_configure("suspect_alert", background="#7F1D1D", foreground="#FEE2E2")
+        tree.tag_configure("clean_log", background="#1E293B", foreground="#94A3B8")
+
+        def refresh_table_data():
+            """Clears and re-reads the global database variables live."""
+            # Track selected item to preserve user focus across updates
+            selected_item = tree.selection()
+            selected_values = tree.item(selected_item)['values'] if selected_item else None
+
+            # Flush screen data grid canvas
+            for item in tree.get_children():
+                tree.delete(item)
+
+            # Re-read active application runtime state registers
+            for ip, info in network_database.items():
+                if not info or not isinstance(info, dict): 
+                    continue
+                
+                logs = info.get("web_logs", [])
+                for log in logs:
+                    if not isinstance(log, dict): 
+                        continue
+
+                    url = str(log.get("url", "")).strip()
+                    timestamp = str(log.get("time", "UNKNOWN")).strip()
+
+                    if not url: 
+                        continue
+
+                    # Filter tracking parameters
+                    url_clean = url.lower().replace("http://", "").replace("https://", "").replace("www.", "")
+                    if url_clean.startswith("172."):
+                        continue
+
+                    is_whitelisted = any(str(awl).strip().lower() in url_clean for awl in self.threat_whitelist if str(awl).strip())
+                    threat_tag = "CLEAN" if is_whitelisted else "SUSPECT"
+                    if threat_tag == "CLEAN":
+                        continue
+                    # Populate row elements
+                    item_id = tree.insert("", tk.END, values=(ip, threat_tag, url, timestamp))
+                    
+                    # Apply row styling tags
+                    if threat_tag == "SUSPECT":
+                        tree.item(item_id, tags=("suspect_alert",))
+                    else:
+                        tree.item(item_id, tags=("clean_log",))
+
+            # Restore user selection if the item still exists
+            if selected_values:
+                for item in tree.get_children():
+                    if tree.item(item)['values'] == selected_values:
+                        tree.selection_set(item)
+                        break
+
+        def auto_loop_refresh():
+            """Triggers every 2000ms (2 seconds) to sync with background thread telemetry."""
+            if threat_win.winfo_exists():  # Safely break loop cycle if operator exits the view window
+                refresh_table_data()
+                threat_win.after(2000, auto_loop_refresh)
+
+        # Initial call loops to sync active state pipelines instantly
+        refresh_table_data()
+        auto_loop_refresh()
+
+    def open_list_folder(self):
+        """Cross-platform hook to spawn the native OS file manager pointing to data_store/list"""
+        import os
+        import platform
+        import subprocess
+
+        # Target directory pathing setup
+        target_dir = os.path.abspath(os.path.join("data_store", "list"))
+        
+        # Self-healing check: Ensure the folder structural sequence exists safely
+        if not os.path.exists(target_dir):
+            os.makedirs(target_dir, exist_ok=True)
+
+        try:
+            current_os = platform.system().lower()
+            if current_os == "windows":
+                os.startfile(target_dir)
+            elif current_os == "darwin":  # macOS context profile
+                subprocess.Popen(["open", target_dir])
+            else:  # Linux distributions
+                subprocess.Popen(["xdg-open", target_dir])
+        except Exception as e:
+            tk.messagebox.showerror(
+                "System Error", 
+                f"Failed to access local file matrix subsystem: {str(e)}"
+            )
+
+    def compile_startup_device_list(self):
+        """
+        Compiles a comprehensive structural hardware mapping across all endpoints
+        by reading the latest offline JSON files on bootup.
+        """
+        import os
+        import json
+        from datetime import datetime
+
+        try:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            list_dir = os.path.join("data_store", "List")
+            base_device_dir = os.path.join("data_store", "Device")
+            os.makedirs(list_dir, exist_ok=True)
+
+            output_file_path = os.path.join(list_dir, f"{today_str}.txt")
+
+            lines = [
+                "======================================================================================",
+                f" NETWORK SYSTEM SPECIFICATION MATRIX LOG // GENERATED: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                "======================================================================================",
+                f"{'IP ADDRESS':<18} | {'DEVICE TYPE':<20} | DEVICE NAME",
+                "-------------------|----------------------|-------------------------------------------"
+            ]
+
+            has_records = False
+
+            # Check if directory exists and has subfolders
+            if os.path.exists(base_device_dir):
+                # Loop through every IP folder under data_store/Device/
+                for ip_folder in sorted(os.listdir(base_device_dir)):
+                    ip_path = os.path.join(base_device_dir, ip_folder)
+                    
+                    if os.path.isdir(ip_path):
+                        # Find today's file or the most recent log file inside this IP directory
+                        target_file = os.path.join(ip_path, f"hardware_{today_str}.json")
+                        
+                        # Fallback: if today's file doesn't exist yet, get the most recent log file
+                        if not os.path.exists(target_file):
+                            all_files = sorted(glob.glob(os.path.join(ip_path, "*.json")))
+                            if all_files:
+                                target_file = all_files[-1] # Pick freshest historical entry
+                        
+                        if os.path.exists(target_file):
+                            try:
+                                with open(target_file, "r", encoding="utf-8") as f:
+                                    payload = json.load(f)
+                                
+                                specs = payload.get("system_specs", {})
+                                ram_val = specs.get("ram")
+                                cpu_val = specs.get("cpu")
+
+                                if ram_val:
+                                    lines.append(f"{ip_folder:<18} | {'SYSTEM RAM':<20} | {ram_val}")
+                                    has_records = True
+                                if cpu_val:
+                                    lines.append(f"{ip_folder:<18} | {'SYSTEM CPU':<20} | {cpu_val}")
+                                    has_records = True
+
+                                for dev in payload.get("connected_devices", []):
+                                    dev_type = str(dev.get("type", "GENERIC")).upper()
+                                    dev_name = dev.get("name", "UNKNOWN COMPONENT")
+                                    dev_status = dev.get("status", "Active")
+                                    lines.append(f"{ip_folder:<18} | {dev_type:<20} | {dev_name} [{dev_status}]")
+                                    has_records = True
+                                    
+                                lines.append("-------------------|----------------------|-------------------------------------------")
+                            except Exception:
+                                pass
+
+            if not has_records:
+                lines.append(" [!] No active hardware configurations found registered inside network storage logs.")
+
+            with open(output_file_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+                
+            print(f"[+] Global database inventory log table compiled at: {output_file_path}")
+
+        except Exception as e:
+            print(f"[-] Critical failure during compilation matrix generation: {e}")
+
+    def open_hardware_change_window(self):
+        """Spawns an administrative grid module panel displaying tracked differences across 7 days."""
+        if hasattr(self, 'hw_change_win') and self.hw_change_win and self.hw_change_win.winfo_exists():
+            self.hw_change_win.lift()
+            return
+
+        self.hw_change_win = ctk.CTkToplevel(self.root)
+        self.hw_change_win.title("HARDWARE MUTATION TRACE LOGS")
+        self.hw_change_win.geometry("850x550")
+        self.hw_change_win.configure(fg_color=self.c_inner)
+        self.hw_change_win.attributes("-topmost", True)
+
+        # Header Title
+        lbl_title = ctk.CTkLabel(
+            self.hw_change_win, 
+            text="// HARDWARE SPECIFICATION DRIFT MATRIX (7-DAY ANALYSIS WINDOW)", 
+            font=ctk.CTkFont(family="Consolas", size=13, weight="bold"), 
+            text_color=self.c_accent
+        )
+        lbl_title.pack(anchor=tk.W, padx=25, pady=(20, 10))
+
+        # Main Scrollable Container Table Window Frame Context
+        table_container = ctk.CTkScrollableFrame(self.hw_change_win, fg_color=self.c_card, border_width=1, border_color=self.c_border)
+        table_container.pack(fill=tk.BOTH, expand=True, padx=25, pady=(5, 25))
+
+        # Grid Header Labels Layout 
+        headers = ["IP ADDRESS", "DEVICE TYPE", "PREVIOUS COMPONENT SNAPSHOT", "CURRENT COMPONENT SNAPSHOT"]
+        widths = [130, 120, 260, 260]
+
+        header_frame = ctk.CTkFrame(table_container, fg_color=self.c_inner, height=36, corner_radius=4)
+        header_frame.pack(fill=ctk.X, pady=(0, 10))
+        header_frame.pack_propagate(False)
+
+        for col_idx, text in enumerate(headers):
+            lbl_h = ctk.CTkLabel(
+                header_frame, text=text, 
+                font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+                text_color=self.c_text_main, width=widths[col_idx], anchor=tk.W
+            )
+            lbl_h.pack(side=tk.LEFT, padx=10, fill=tk.Y)
+
+        # --- DATA GENERATION & DELTA COMPILER PASS ---
+        import os
+        import glob
+        import json
+        from datetime import datetime, timedelta
+
+        active_ips = [ip for ip, info in network_database.items() if info.get("status", "OFFLINE") != "OFFLINE"]
+        base_device_dir = os.path.join("data_store", "Device")
+        historical_days = [(datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, 7)]
+
+        has_changes = False
+
+        for ip in active_ips:
+            current_data = network_database.get(ip, {})
+            current_devices = current_data.get("devices", [])
+            current_specs = current_data.get("system_specs", {
+                "hostname": current_data.get("hostname", "UNKNOWN"),
+                "os": current_data.get("os", "UNKNOWN"),
+                "cpu": current_data.get("cpu", "UNKNOWN"),
+                "ram": current_data.get("ram", "UNKNOWN"),
+                "mac": current_data.get("mac", "UNKNOWN")
+            })
+            
+            # Target directory for this specific IP subfolder
+            ip_device_dir = os.path.join(base_device_dir, ip)
+            
+            # Find baseline history data file from oldest to newest day
+            old_payload = None
+            for past_date in reversed(historical_days):
+                hist_file = os.path.join(ip_device_dir, f"hardware_{past_date}.json")
+                if os.path.exists(hist_file):
+                    try:
+                        with open(hist_file, "r", encoding="utf-8") as f:
+                            old_payload = json.load(f)
+                            break
+                    except Exception:
+                        pass
+
+            if old_payload is None:
+                continue
+
+            # Check System Specs (RAM)
+            old_specs = old_payload.get("system_specs", {})
+            old_ram = old_specs.get("ram", "[UNKNOWN RAM]")
+            new_ram = current_specs.get("ram", "[UNKNOWN RAM]")
+            
+            if old_ram != new_ram:
+                has_changes = True
+                row_frame = ctk.CTkFrame(table_container, fg_color="transparent")
+                row_frame.pack(fill=ctk.X, pady=4)
+
+                ctk.CTkLabel(row_frame, text=ip, font=ctk.CTkFont(family="Consolas", size=11), width=widths[0], anchor=tk.NW, text_color="#FFFFFF").pack(side=tk.LEFT, padx=10, fill=tk.Y)
+                ctk.CTkLabel(row_frame, text="SYSTEM RAM", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), width=widths[1], anchor=tk.NW, text_color="#F59E0B").pack(side=tk.LEFT, padx=10, fill=tk.Y)
+                ctk.CTkLabel(row_frame, text=old_ram, font=ctk.CTkFont(family="Segoe UI", size=11), width=widths[2], justify=tk.LEFT, anchor=tk.NW, text_color="#94A3B8").pack(side=tk.LEFT, padx=10, fill=tk.Y)
+                ctk.CTkLabel(row_frame, text=new_ram, font=ctk.CTkFont(family="Segoe UI", size=11), width=widths[3], justify=tk.LEFT, anchor=tk.NW, text_color="#10B981").pack(side=tk.LEFT, padx=10, fill=tk.Y)
+
+                sep = ctk.CTkFrame(table_container, height=1, fg_color=self.c_border)
+                sep.pack(fill=ctk.X, pady=4)
+
+            # Peripheral device diffing loop
+            old_devices_list = old_payload.get("connected_devices", [])
+            
+            current_map = {}
+            for d in current_devices:
+                dtype = str(d.get("type", "GENERIC")).strip().upper()
+                current_map.setdefault(dtype, []).append(f"{d.get('name', 'UNKNOWN')} [{d.get('status', 'ACTIVE')}]")
+
+            old_map = {}
+            for d in old_devices_list:
+                dtype = str(d.get("type", "GENERIC")).strip().upper()
+                old_map.setdefault(dtype, []).append(f"{d.get('name', 'UNKNOWN')} [{d.get('status', 'ACTIVE')}]")
+
+            all_types = set(list(current_map.keys()) + list(old_map.keys()))
+
+            for dev_type in all_types:
+                old_list = sorted(old_map.get(dev_type, []))
+                new_list = sorted(current_map.get(dev_type, []))
+
+                if old_list != new_list:
+                    has_changes = True
+                    old_str = "\n".join(old_list) if old_list else "[COMPONENT REMOVED / NONE]"
+                    new_str = "\n".join(new_list) if new_list else "[COMPONENT REMOVED / NONE]"
+
+                    row_frame = ctk.CTkFrame(table_container, fg_color="transparent")
+                    row_frame.pack(fill=ctk.X, pady=4)
+
+                    ctk.CTkLabel(row_frame, text=ip, font=ctk.CTkFont(family="Consolas", size=11), width=widths[0], anchor=tk.NW, text_color="#FFFFFF").pack(side=tk.LEFT, padx=10, fill=tk.Y)
+                    ctk.CTkLabel(row_frame, text=dev_type, font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), width=widths[1], anchor=tk.NW, text_color=self.c_accent).pack(side=tk.LEFT, padx=10, fill=tk.Y)
+                    ctk.CTkLabel(row_frame, text=old_str, font=ctk.CTkFont(family="Segoe UI", size=11), width=widths[2], justify=tk.LEFT, anchor=tk.NW, text_color="#94A3B8").pack(side=tk.LEFT, padx=10, fill=tk.Y)
+                    ctk.CTkLabel(row_frame, text=new_str, font=ctk.CTkFont(family="Segoe UI", size=11), width=widths[3], justify=tk.LEFT, anchor=tk.NW, text_color="#10B981").pack(side=tk.LEFT, padx=10, fill=tk.Y)
+
+                    sep = ctk.CTkFrame(table_container, height=1, fg_color=self.c_border)
+                    sep.pack(fill=ctk.X, pady=4)
+
+        if not has_changes:
+            lbl_empty = ctk.CTkLabel(
+                table_container, 
+                text="✔ No hardware modifications or configuration anomalies detected across active endpoints within the last 6 days.", 
+                font=ctk.CTkFont(family="Segoe UI", size=12, slant="italic"), 
+                text_color="#94A3B8"
+            )
+            lbl_empty.pack(pady=40)
 
     def open_video_call_manager(self):
         """Spawns an auto-refreshing checkbox-driven dashboard displaying real-time 
@@ -2245,6 +2687,26 @@ class LANMonitorGUI:
         self.update_data_panes(self.active_remote_ip)
 
 if __name__ == "__main__":
+    # Pre-startup cleaning pass to parse nested IP subfolders
+    import os
+    import glob
+    from datetime import datetime, timedelta
+    
+    base_device_dir = os.path.join("data_store", "Device")
+    if os.path.exists(base_device_dir):
+        allowed_filenames = [
+            f"hardware_{(datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')}.json"
+            for i in range(7)
+        ]
+        
+        for root_dir, dirs, files in os.walk(base_device_dir):
+            for file in files:
+                if file.endswith(".json") and file not in allowed_filenames:
+                    try:
+                        os.remove(os.path.join(root_dir, file))
+                    except Exception:
+                        pass
+
     root = TkinterDnD.Tk()
     ctk.deactivate_automatic_dpi_awareness()
     root.block_update_dimensions_event = lambda: None
@@ -2254,16 +2716,18 @@ if __name__ == "__main__":
         class TkExtensionWrapper:
             def __init__(self, original_tk):
                 self._orig = original_tk
-                # Add BOTH handlers here to satisfy customtkinter's scaling loop
                 self.block_update_dimensions_event = lambda: None
                 self.unblock_update_dimensions_event = lambda: None
                 
             def __getattr__(self, attr):
-                # Fall back to native C attributes for everything else
                 return getattr(self._orig, attr)
         
         root.tk = TkExtensionWrapper(root.tk)
+        
     app = LANMonitorGUI(root)
+
+    # Note: app.compile_startup_device_list() has been removed from here
+    # to avoid empty database generation runs on initial boot.
+
     threading.Thread(target=start_agent_listener, args=(app.refresh_device_list,), daemon=True).start()
-    #threading.Thread(target=active_device_sweeper, args=(app.refresh_device_list,), daemon=True).start()
     root.mainloop()

